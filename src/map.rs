@@ -33,42 +33,142 @@ struct TierEdge {
     to_mod: String,
 }
 
-/// Render the bird's eye module map.
-pub fn render_map(rs_files: &[PathBuf], project_path: &Path, verbose: bool) {
-    let term_w = render::terminal_width();
-    let symbols = ast_parser::parse_project(rs_files);
-    let dep_analysis = deps::analyze_deps(rs_files, project_path);
-
-    println!(
-        "\n{}",
-        "── Architectural Module Map ───────────────────────────"
-            .bright_cyan()
-            .bold()
+/// Print the tier header separator line.
+fn render_tier_header(tier_idx: usize, max_tier: usize, term_w: usize) {
+    let tier_label = match tier_idx {
+        0 => "Entry Points".to_string(),
+        t if t == max_tier && max_tier > 0 => "Leaf Modules".to_string(),
+        t => format!("Layer {}", t),
+    };
+    let separator = format!(
+        "╶╶╶ {} {}",
+        tier_label,
+        "╶".repeat(term_w.saturating_sub(tier_label.len()).saturating_sub(6))
     );
+    println!("\n{}", separator.dimmed());
+}
 
-    if verbose {
-        render::verbose_block(&[
-            "Bird's-eye module map arranged by dependency depth (BFS from roots).",
-            "Tier 0 = Entry Points (zero in-degree — nothing depends on them).",
-            "Deepest tier = Leaf Modules (only depended upon, never import others).",
-            "Inside each box: S = structs, E = enums, T = traits, f = functions.",
-            "  Numbers after the module name: LoC count and pub/total item ratio.",
-            "  ● (white) in the legend = public items (pub fn, pub struct, etc.).",
-            "Heatbar (▁▃▅▇) = per-function complexity distribution within the module:",
-            "  green (▁) = low complexity, yellow (▅) = medium, red (▇) = high.",
-            "Border style: ╔ (double-line, bold) = hub module (connectivity > mean+1σ).",
-            "  ┌ (single-line, dimmed) = regular or leaf module.",
-            "Arrows (───▶) show cross-tier dependency flow between modules.",
-            "  Arrow weight in parentheses = number of dependency edges along that path.",
-        ]);
-        render::guide_ref("architecture");
+/// Render the module boxes for a single tier in a side-by-side layout.
+fn render_tier_modules(
+    group: &[String],
+    module_boxes: &HashMap<String, ModuleBox>,
+    hub_threshold: usize,
+    max_loc: usize,
+    term_w: usize,
+) {
+    let box_min_width = 30;
+    let max_side_by_side = (term_w / box_min_width).max(1);
+
+    let mut i = 0;
+    while i < group.len() {
+        let row_end = (i + max_side_by_side).min(group.len());
+        let row = &group[i..row_end];
+        let col_count = row.len();
+        let col_width = if col_count > 1 {
+            (term_w / col_count).min(term_w).max(box_min_width)
+        } else {
+            term_w.min(80).max(box_min_width)
+        };
+
+        let mut box_lines: Vec<Vec<String>> = Vec::new();
+        for mod_name in row {
+            if let Some(mbox) = module_boxes.get(mod_name.as_str()) {
+                let is_hub = mbox.connectivity >= hub_threshold && hub_threshold > 0;
+                let height = proportional_height(mbox.code_lines, max_loc);
+                let lines =
+                    render_module_box(mbox, col_width.saturating_sub(1), is_hub, height);
+                box_lines.push(lines);
+            }
+        }
+
+        let max_lines = box_lines.iter().map(|b| b.len()).max().unwrap_or(0);
+
+        for line_idx in 0..max_lines {
+            let mut row_str = String::new();
+            for (col_idx, lines) in box_lines.iter().enumerate() {
+                let line = if line_idx < lines.len() {
+                    &lines[line_idx]
+                } else {
+                    ""
+                };
+                let vis_len = render::visible_len(line);
+                let pad = col_width.saturating_sub(1).saturating_sub(vis_len);
+                row_str.push_str(line);
+                row_str.push_str(&" ".repeat(pad));
+                if col_idx < box_lines.len() - 1 {
+                    row_str.push(' ');
+                }
+            }
+            println!("{}", row_str);
+        }
+
+        i = row_end;
     }
+}
 
-    if symbols.files.is_empty() {
-        println!("  {}", "No modules found.".dimmed());
+/// Render weighted dependency arrows from the given tier to deeper tiers.
+fn render_tier_arrows(tier_edges: &[TierEdge], tier_idx: usize) {
+    let arrows_from_tier: Vec<&TierEdge> = tier_edges
+        .iter()
+        .filter(|e| e.from_tier == tier_idx && e.to_tier > tier_idx)
+        .collect();
+
+    if arrows_from_tier.is_empty() {
         return;
     }
 
+    let mut arrow_groups: HashMap<(&str, &str), usize> = HashMap::new();
+    for e in &arrows_from_tier {
+        *arrow_groups
+            .entry((e.from_mod.as_str(), e.to_mod.as_str()))
+            .or_insert(0) += 1;
+    }
+    let mut arrow_list: Vec<((&str, &str), usize)> =
+        arrow_groups.into_iter().collect();
+    arrow_list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0 .0.cmp(b.0 .0)));
+
+    let show_count = arrow_list.len().min(6);
+    let mut arrow_strs: Vec<String> = Vec::new();
+    for ((from, to), count) in arrow_list.iter().take(show_count) {
+        let weight_str = if *count > 1 {
+            format!("({})", count)
+        } else {
+            String::new()
+        };
+        arrow_strs.push(format!(
+            "{}→{}{}",
+            from.bright_blue(),
+            to.bright_blue(),
+            weight_str.dimmed()
+        ));
+    }
+    if arrow_list.len() > show_count {
+        arrow_strs.push(
+            format!("+{} more", arrow_list.len() - show_count)
+                .dimmed()
+                .to_string(),
+        );
+    }
+    println!("    {} {}", "───▶".dimmed(), arrow_strs.join("  "));
+}
+
+/// Prepared data for rendering the module map.
+struct MapRenderData {
+    module_boxes: HashMap<String, ModuleBox>,
+    tier_groups: Vec<Vec<String>>,
+    tier_edges: Vec<TierEdge>,
+    max_loc: usize,
+    hub_threshold: usize,
+    max_tier: usize,
+}
+
+/// Gather and prepare all data needed to render the module map.
+fn prepare_map_data(
+    rs_files: &[PathBuf],
+    project_path: &Path,
+    symbols: &ProjectSymbols,
+    dep_analysis: &deps::DepAnalysis,
+) -> Option<MapRenderData> {
     // Get LoC data per file
     let (file_stats, _) = loc::analyze_files(rs_files);
     let mut loc_by_mod: HashMap<String, usize> = HashMap::new();
@@ -78,7 +178,7 @@ pub fn render_map(rs_files: &[PathBuf], project_path: &Path, verbose: bool) {
     }
 
     // Get complexity data
-    let func_complexities = complexity::compute_all(&symbols, project_path);
+    let func_complexities = complexity::compute_all(symbols, project_path);
     let mut complexity_by_mod: HashMap<String, Vec<f64>> = HashMap::new();
     for fc in &func_complexities {
         let mod_name = file_to_module_name(&fc.file);
@@ -90,20 +190,19 @@ pub fn render_map(rs_files: &[PathBuf], project_path: &Path, verbose: bool) {
 
     // Build module boxes
     let module_boxes = build_module_boxes(
-        &symbols,
+        symbols,
         project_path,
         &loc_by_mod,
         &complexity_by_mod,
-        &dep_analysis,
+        dep_analysis,
     );
 
     if module_boxes.is_empty() {
-        println!("  {}", "No modules found.".dimmed());
-        return;
+        return None;
     }
 
     // Compute tier assignments via dependency depth (BFS from roots)
-    let tiers = compute_tiers(&module_boxes, &dep_analysis);
+    let tiers = compute_tiers(&module_boxes, dep_analysis);
 
     // Group modules by tier
     let max_tier = tiers.values().copied().max().unwrap_or(0);
@@ -150,119 +249,70 @@ pub fn render_map(rs_files: &[PathBuf], project_path: &Path, verbose: bool) {
     };
     let hub_threshold = (mean_conn + 1.0) as usize;
 
+    Some(MapRenderData {
+        module_boxes,
+        tier_groups,
+        tier_edges,
+        max_loc,
+        hub_threshold,
+        max_tier,
+    })
+}
+
+/// Render the bird's eye module map.
+pub fn render_map(rs_files: &[PathBuf], project_path: &Path, verbose: bool) {
+    let term_w = render::terminal_width();
+    let symbols = ast_parser::parse_project(rs_files);
+    let dep_analysis = deps::analyze_deps(rs_files, project_path);
+
+    println!(
+        "\n{}",
+        "── Architectural Module Map ───────────────────────────"
+            .bright_cyan()
+            .bold()
+    );
+
+    if verbose {
+        render::verbose_block(&[
+            "Bird's-eye module map arranged by dependency depth (BFS from roots).",
+            "Tier 0 = Entry Points (zero in-degree — nothing depends on them).",
+            "Deepest tier = Leaf Modules (only depended upon, never import others).",
+            "Inside each box: S = structs, E = enums, T = traits, f = functions.",
+            "  Numbers after the module name: LoC count and pub/total item ratio.",
+            "  ● (white) in the legend = public items (pub fn, pub struct, etc.).",
+            "Heatbar (▁▃▅▇) = per-function complexity distribution within the module:",
+            "  green (▁) = low complexity, yellow (▅) = medium, red (▇) = high.",
+            "Border style: ╔ (double-line, bold) = hub module (connectivity > mean+1σ).",
+            "  ┌ (single-line, dimmed) = regular or leaf module.",
+            "Arrows (───▶) show cross-tier dependency flow between modules.",
+            "  Arrow weight in parentheses = number of dependency edges along that path.",
+        ]);
+        render::guide_ref("architecture");
+    }
+
+    if symbols.files.is_empty() {
+        println!("  {}", "No modules found.".dimmed());
+        return;
+    }
+
+    let data = match prepare_map_data(rs_files, project_path, &symbols, &dep_analysis) {
+        Some(d) => d,
+        None => {
+            println!("  {}", "No modules found.".dimmed());
+            return;
+        }
+    };
+
     // Render tier by tier (top = tier 0 = entry points, bottom = leaves)
-    for tier_idx in 0..=max_tier {
-        let group = &tier_groups[tier_idx];
+    for tier_idx in 0..=data.max_tier {
+        let group = &data.tier_groups[tier_idx];
         if group.is_empty() {
             continue;
         }
 
-        // Tier header
-        let tier_label = match tier_idx {
-            0 => "Entry Points".to_string(),
-            t if t == max_tier && max_tier > 0 => "Leaf Modules".to_string(),
-            t => format!("Layer {}", t),
-        };
-        let separator = format!(
-            "╶╶╶ {} {}",
-            tier_label,
-            "╶".repeat(term_w.saturating_sub(tier_label.len()).saturating_sub(6))
-        );
-        println!("\n{}", separator.dimmed());
-
-        // Decide layout: side-by-side if terminal is wide enough
-        let box_min_width = 30;
-        let max_side_by_side = (term_w / box_min_width).max(1);
-
-        // Render modules in rows of max_side_by_side
-        let mut i = 0;
-        while i < group.len() {
-            let row_end = (i + max_side_by_side).min(group.len());
-            let row = &group[i..row_end];
-            let col_count = row.len();
-            let col_width = if col_count > 1 {
-                (term_w / col_count).min(term_w).max(box_min_width)
-            } else {
-                term_w.min(80).max(box_min_width)
-            };
-
-            // Render boxes side-by-side
-            let mut box_lines: Vec<Vec<String>> = Vec::new();
-            for mod_name in row {
-                if let Some(mbox) = module_boxes.get(mod_name.as_str()) {
-                    let is_hub = mbox.connectivity >= hub_threshold && hub_threshold > 0;
-                    let height = proportional_height(mbox.code_lines, max_loc);
-                    let lines =
-                        render_module_box(mbox, col_width.saturating_sub(1), is_hub, height);
-                    box_lines.push(lines);
-                }
-            }
-
-            let max_lines = box_lines.iter().map(|b| b.len()).max().unwrap_or(0);
-
-            for line_idx in 0..max_lines {
-                let mut row_str = String::new();
-                for (col_idx, lines) in box_lines.iter().enumerate() {
-                    let line = if line_idx < lines.len() {
-                        &lines[line_idx]
-                    } else {
-                        ""
-                    };
-                    let vis_len = render::visible_len(line);
-                    let pad = col_width.saturating_sub(1).saturating_sub(vis_len);
-                    row_str.push_str(line);
-                    row_str.push_str(&" ".repeat(pad));
-                    if col_idx < box_lines.len() - 1 {
-                        row_str.push(' ');
-                    }
-                }
-                println!("{}", row_str);
-            }
-
-            i = row_end;
-        }
-
-        // Render weighted arrows from this tier to deeper tiers
-        let arrows_from_tier: Vec<&TierEdge> = tier_edges
-            .iter()
-            .filter(|e| e.from_tier == tier_idx && e.to_tier > tier_idx)
-            .collect();
-
-        if !arrows_from_tier.is_empty() {
-            let mut arrow_groups: HashMap<(&str, &str), usize> = HashMap::new();
-            for e in &arrows_from_tier {
-                *arrow_groups
-                    .entry((e.from_mod.as_str(), e.to_mod.as_str()))
-                    .or_insert(0) += 1;
-            }
-            let mut arrow_list: Vec<((&str, &str), usize)> =
-                arrow_groups.into_iter().collect();
-            arrow_list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0 .0.cmp(b.0 .0)));
-
-            let show_count = arrow_list.len().min(6);
-            let mut arrow_strs: Vec<String> = Vec::new();
-            for ((from, to), count) in arrow_list.iter().take(show_count) {
-                let weight_str = if *count > 1 {
-                    format!("({})", count)
-                } else {
-                    String::new()
-                };
-                arrow_strs.push(format!(
-                    "{}→{}{}",
-                    from.bright_blue(),
-                    to.bright_blue(),
-                    weight_str.dimmed()
-                ));
-            }
-            if arrow_list.len() > show_count {
-                arrow_strs.push(
-                    format!("+{} more", arrow_list.len() - show_count)
-                        .dimmed()
-                        .to_string(),
-                );
-            }
-            println!("    {} {}", "───▶".dimmed(), arrow_strs.join("  "));
-        }
+        render_tier_header(tier_idx, data.max_tier, term_w);
+        render_tier_modules(group, &data.module_boxes, data.hub_threshold, data.max_loc, term_w);
+        render_tier_arrows(&data.tier_edges, tier_idx);
     }
 
     // Legend
@@ -286,6 +336,8 @@ pub fn render_map(rs_files: &[PathBuf], project_path: &Path, verbose: bool) {
     );
     println!();
 }
+
+
 
 /// Convert a file path like "src/foo.rs" to module name "foo".
 fn file_to_module_name(file: &str) -> String {
@@ -478,25 +530,15 @@ fn proportional_height(code_lines: usize, max_loc: usize) -> usize {
     height.clamp(1, 6)
 }
 
-/// Render a single module box, returning lines.
-fn render_module_box(
+/// Build the header line for a module box.
+fn render_box_header(
     mbox: &ModuleBox,
     box_width: usize,
     is_hub: bool,
-    prop_height: usize,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    let box_width = box_width.max(20);
-    let inner_w = box_width.saturating_sub(4); // "│ " + " │" = 4 chars
-
-    // Border characters: hubs get bold double-line borders
-    let (tl, tr, bl, br, h, v) = if is_hub {
-        ("╔", "╗", "╚", "╝", "═", "║")
-    } else {
-        ("┌", "┐", "└", "┘", "─", "│")
-    };
-
-    // Header line
+    h: &str,
+    tl: &str,
+    tr: &str,
+) -> String {
     let header = format!(" {} ", mbox.name);
     let pub_hint = format!("{}/{} pub", mbox.pub_count, mbox.total_count);
     let loc_hint = format!("{} loc", mbox.code_lines);
@@ -509,7 +551,7 @@ fn render_module_box(
     let fill = h.repeat(fill_len);
 
     if is_hub {
-        lines.push(format!(
+        format!(
             "{}{}{}{}{}{}",
             tl.bold(),
             h.repeat(1).bold(),
@@ -517,9 +559,9 @@ fn render_module_box(
             fill.bold(),
             format!(" {} ", meta).dimmed(),
             tr.bold(),
-        ));
+        )
     } else {
-        lines.push(format!(
+        format!(
             "{}{}{}{}{}{}",
             tl.dimmed(),
             h.repeat(1).dimmed(),
@@ -527,10 +569,12 @@ fn render_module_box(
             fill.dimmed(),
             format!(" {} ", meta).dimmed(),
             tr.dimmed(),
-        ));
+        )
     }
+}
 
-    // Content lines
+/// Build the content lines (heatbar, symbols) for a module box.
+fn build_box_content(mbox: &ModuleBox, inner_w: usize, prop_height: usize) -> Vec<String> {
     let mut content: Vec<String> = Vec::new();
 
     // Complexity heatbar
@@ -575,8 +619,23 @@ fn render_module_box(
         content.truncate(prop_height);
     }
 
-    // Render content with borders
-    for line in &content {
+    content
+}
+
+/// Render bordered content lines and the footer of a module box.
+fn render_box_body(
+    content: &[String],
+    inner_w: usize,
+    box_width: usize,
+    is_hub: bool,
+    v: &str,
+    bl: &str,
+    br: &str,
+    h: &str,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for line in content {
         let vis_len = render::visible_len(line);
         let pad = inner_w.saturating_sub(vis_len);
         if is_hub {
@@ -618,6 +677,31 @@ fn render_module_box(
 
     lines
 }
+
+/// Render a single module box, returning lines.
+fn render_module_box(
+    mbox: &ModuleBox,
+    box_width: usize,
+    is_hub: bool,
+    prop_height: usize,
+) -> Vec<String> {
+    let box_width = box_width.max(20);
+    let inner_w = box_width.saturating_sub(4); // "│ " + " │" = 4 chars
+
+    // Border characters: hubs get bold double-line borders
+    let (tl, tr, bl, br, h, v) = if is_hub {
+        ("╔", "╗", "╚", "╝", "═", "║")
+    } else {
+        ("┌", "┐", "└", "┘", "─", "│")
+    };
+
+    let mut lines = Vec::new();
+    lines.push(render_box_header(mbox, box_width, is_hub, h, tl, tr));
+    let content = build_box_content(mbox, inner_w, prop_height);
+    lines.extend(render_box_body(&content, inner_w, box_width, is_hub, v, bl, br, h));
+    lines
+}
+
 
 /// Build a complexity heatbar from function scores.
 fn build_heatbar(scores: &[f64], max_width: usize) -> String {

@@ -418,38 +418,19 @@ impl<'a, 'ast> Visit<'ast> for StructuralVisitor<'a> {
 const SIG_THRESHOLD: f64 = 0.6;
 const REPORT_THRESHOLD: f64 = 0.7;
 
-/// Run redundancy detection on the project. Returns pairs sorted by similarity descending.
-pub fn detect_redundancy(rs_files: &[PathBuf], project_path: &Path) -> Vec<RedundantPair> {
-    let sigs = extract_signatures(rs_files, project_path);
-
-    if sigs.len() < 2 {
-        return Vec::new();
-    }
-
-    // Pass 1: signature similarity
-    let sig_pairs = find_signature_pairs(&sigs, SIG_THRESHOLD);
-
-    // Pass 2: structural similarity for candidate pairs
-    // Also compute structural hashes for all functions for direct structural duplicate detection
-    let mut structural_hashes: HashMap<usize, u64> = HashMap::new();
-
-    for (i, sig) in sigs.iter().enumerate() {
-        let full_path = project_path.join(&sig.file);
-        if let Some(hash) = structural_hash_from_file(&full_path, project_path, &sig.name) {
-            structural_hashes.insert(i, hash);
-        }
-    }
-
-    // Find structural duplicates (identical hashes)
+/// Find structural duplicate pairs from functions sharing identical AST hashes.
+fn find_structural_duplicates(
+    sigs: &[FunctionSig],
+    structural_hashes: &HashMap<usize, u64>,
+) -> (Vec<RedundantPair>, HashSet<(usize, usize)>) {
     let mut hash_to_indices: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (&idx, &hash) in &structural_hashes {
+    for (&idx, &hash) in structural_hashes {
         hash_to_indices.entry(hash).or_default().push(idx);
     }
 
     let mut results: Vec<RedundantPair> = Vec::new();
     let mut seen_pairs: HashSet<(usize, usize)> = HashSet::new();
 
-    // Add structural duplicate pairs
     for indices in hash_to_indices.values() {
         if indices.len() < 2 {
             continue;
@@ -459,7 +440,6 @@ pub fn detect_redundancy(rs_files: &[PathBuf], project_path: &Path) -> Vec<Redun
                 let a = indices[i].min(indices[j]);
                 let b = indices[i].max(indices[j]);
                 if seen_pairs.insert((a, b)) {
-                    // Check if this pair also has signature similarity
                     let sig_sim = signature_similarity(&sigs[a], &sigs[b]);
                     let kind = if sig_sim >= SIG_THRESHOLD {
                         SimilarityKind::Both
@@ -473,7 +453,7 @@ pub fn detect_redundancy(rs_files: &[PathBuf], project_path: &Path) -> Vec<Redun
                         func_b: sigs[b].name.clone(),
                         file_b: sigs[b].file.clone(),
                         line_b: sigs[b].line_start,
-                        similarity: 1.0, // Structural exact match
+                        similarity: 1.0,
                         kind,
                     });
                 }
@@ -481,36 +461,78 @@ pub fn detect_redundancy(rs_files: &[PathBuf], project_path: &Path) -> Vec<Redun
         }
     }
 
-    // Add signature-similar pairs that weren't already found structurally
-    for (i, j, sim) in &sig_pairs {
+    (results, seen_pairs)
+}
+
+/// Merge signature-similar pairs that were not already found as structural duplicates.
+fn merge_signature_pairs(
+    sig_pairs: &[(usize, usize, f64)],
+    sigs: &[FunctionSig],
+    structural_hashes: &HashMap<usize, u64>,
+    seen_pairs: &mut HashSet<(usize, usize)>,
+) -> Vec<RedundantPair> {
+    let mut results = Vec::new();
+
+    for (i, j, sim) in sig_pairs {
         let a = (*i).min(*j);
         let b = (*i).max(*j);
-        if !seen_pairs.contains(&(a, b)) && *sim >= REPORT_THRESHOLD {
-            // Check structural similarity for these candidates
-            let struct_match = match (structural_hashes.get(&a), structural_hashes.get(&b)) {
-                (Some(ha), Some(hb)) => ha == hb,
-                _ => false,
-            };
+        if seen_pairs.contains(&(a, b)) || *sim < REPORT_THRESHOLD {
+            continue;
+        }
 
-            let (final_sim, kind) = if struct_match {
-                (1.0, SimilarityKind::Both)
-            } else {
-                (*sim, SimilarityKind::Signature)
-            };
+        let struct_match = match (structural_hashes.get(&a), structural_hashes.get(&b)) {
+            (Some(ha), Some(hb)) => ha == hb,
+            _ => false,
+        };
 
-            seen_pairs.insert((a, b));
-            results.push(RedundantPair {
-                func_a: sigs[a].name.clone(),
-                file_a: sigs[a].file.clone(),
-                line_a: sigs[a].line_start,
-                func_b: sigs[b].name.clone(),
-                file_b: sigs[b].file.clone(),
-                line_b: sigs[b].line_start,
-                similarity: final_sim,
-                kind,
-            });
+        let (final_sim, kind) = if struct_match {
+            (1.0, SimilarityKind::Both)
+        } else {
+            (*sim, SimilarityKind::Signature)
+        };
+
+        seen_pairs.insert((a, b));
+        results.push(RedundantPair {
+            func_a: sigs[a].name.clone(),
+            file_a: sigs[a].file.clone(),
+            line_a: sigs[a].line_start,
+            func_b: sigs[b].name.clone(),
+            file_b: sigs[b].file.clone(),
+            line_b: sigs[b].line_start,
+            similarity: final_sim,
+            kind,
+        });
+    }
+
+    results
+}
+
+/// Run redundancy detection on the project. Returns pairs sorted by similarity descending.
+pub fn detect_redundancy(rs_files: &[PathBuf], project_path: &Path) -> Vec<RedundantPair> {
+    let sigs = extract_signatures(rs_files, project_path);
+
+    if sigs.len() < 2 {
+        return Vec::new();
+    }
+
+    // Pass 1: signature similarity
+    let sig_pairs = find_signature_pairs(&sigs, SIG_THRESHOLD);
+
+    // Pass 2: structural hashes for all functions
+    let mut structural_hashes: HashMap<usize, u64> = HashMap::new();
+    for (i, sig) in sigs.iter().enumerate() {
+        let full_path = project_path.join(&sig.file);
+        if let Some(hash) = structural_hash_from_file(&full_path, project_path, &sig.name) {
+            structural_hashes.insert(i, hash);
         }
     }
+
+    // Find structural duplicates
+    let (mut results, mut seen_pairs) = find_structural_duplicates(&sigs, &structural_hashes);
+
+    // Merge in signature-similar pairs
+    let sig_results = merge_signature_pairs(&sig_pairs, &sigs, &structural_hashes, &mut seen_pairs);
+    results.extend(sig_results);
 
     // Sort by similarity descending
     results.sort_by(|a, b| {

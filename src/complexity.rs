@@ -227,81 +227,112 @@ impl CognitiveVisitor {
             _ => 0,
         }
     }
+
+    /// Handle `if / else if / else` expressions for cognitive complexity.
+    fn handle_if_expr(&mut self, expr_if: &syn::ExprIf) {
+        self.increment();
+        // Count boolean operators in condition
+        self.complexity += Self::count_boolean_chains(&expr_if.cond);
+        self.nesting += 1;
+        // Visit then branch
+        for stmt in &expr_if.then_branch.stmts {
+            syn::visit::visit_stmt(self, stmt);
+        }
+        self.nesting -= 1;
+        // Visit else branch
+        if let Some((_, else_expr)) = &expr_if.else_branch {
+            self.handle_else_branch(else_expr);
+        }
+    }
+
+    /// Handle the else branch of an if expression.
+    /// Matches original behavior: first else-if is handled inline with no nesting
+    /// penalty, and deeper else branches delegate back to visit_expr.
+    fn handle_else_branch(&mut self, else_expr: &Expr) {
+        match else_expr {
+            Expr::If(inner_if) => {
+                // else if: +1 no nesting penalty (it's a continuation)
+                self.increment_no_nesting();
+                // But the inner if body still gets nesting
+                self.complexity += Self::count_boolean_chains(&inner_if.cond);
+                self.nesting += 1;
+                for stmt in &inner_if.then_branch.stmts {
+                    syn::visit::visit_stmt(self, stmt);
+                }
+                self.nesting -= 1;
+                if let Some((_, inner_else)) = &inner_if.else_branch {
+                    self.handle_inner_else(inner_else);
+                }
+            }
+            Expr::Block(block) => {
+                self.increment_no_nesting();
+                self.nesting += 1;
+                for stmt in &block.block.stmts {
+                    syn::visit::visit_stmt(self, stmt);
+                }
+                self.nesting -= 1;
+            }
+            _ => {
+                syn::visit::visit_expr(self, else_expr);
+            }
+        }
+    }
+
+    /// Handle deeper else branches (third level and beyond).
+    /// Delegates Expr::If back to visit_expr for standard increment-with-nesting,
+    /// matching the original behavior.
+    fn handle_inner_else(&mut self, else_expr: &Expr) {
+        match else_expr {
+            Expr::If(_) => {
+                self.visit_expr(else_expr);
+            }
+            Expr::Block(block) => {
+                self.increment_no_nesting();
+                self.nesting += 1;
+                for stmt in &block.block.stmts {
+                    syn::visit::visit_stmt(self, stmt);
+                }
+                self.nesting -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle `match` expressions for cognitive complexity.
+    fn handle_match_expr(&mut self, m: &syn::ExprMatch) {
+        self.increment();
+        self.nesting += 1;
+        for arm in &m.arms {
+            if arm.guard.is_some() {
+                self.increment_no_nesting();
+            }
+            syn::visit::visit_expr(self, &arm.body);
+        }
+        self.nesting -= 1;
+    }
+
+    /// Handle `for`, `while`, and `loop` expressions for cognitive complexity.
+    fn handle_loop_expr(&mut self, expr: &Expr) {
+        self.increment();
+        self.nesting += 1;
+        syn::visit::visit_expr(self, expr);
+        self.nesting -= 1;
+    }
 }
 
 impl<'ast> Visit<'ast> for CognitiveVisitor {
     fn visit_expr(&mut self, expr: &'ast Expr) {
         match expr {
             Expr::If(expr_if) => {
-                self.increment();
-                // Count boolean operators in condition
-                self.complexity += Self::count_boolean_chains(&expr_if.cond);
-                self.nesting += 1;
-                // Visit then branch
-                for stmt in &expr_if.then_branch.stmts {
-                    syn::visit::visit_stmt(self, stmt);
-                }
-                self.nesting -= 1;
-                // Visit else branch
-                if let Some((_, else_expr)) = &expr_if.else_branch {
-                    match else_expr.as_ref() {
-                        Expr::If(_) => {
-                            // else if: +1 no nesting penalty (it's a continuation)
-                            self.increment_no_nesting();
-                            // But the inner if body still gets nesting
-                            if let Expr::If(inner_if) = else_expr.as_ref() {
-                                self.complexity += Self::count_boolean_chains(&inner_if.cond);
-                                self.nesting += 1;
-                                for stmt in &inner_if.then_branch.stmts {
-                                    syn::visit::visit_stmt(self, stmt);
-                                }
-                                self.nesting -= 1;
-                                if let Some((_, inner_else)) = &inner_if.else_branch {
-                                    if let Expr::If(_) = inner_else.as_ref() {
-                                        self.visit_expr(inner_else);
-                                    } else if let Expr::Block(block) = inner_else.as_ref() {
-                                        self.increment_no_nesting();
-                                        self.nesting += 1;
-                                        for stmt in &block.block.stmts {
-                                            syn::visit::visit_stmt(self, stmt);
-                                        }
-                                        self.nesting -= 1;
-                                    }
-                                }
-                            }
-                        }
-                        Expr::Block(block) => {
-                            self.increment_no_nesting();
-                            self.nesting += 1;
-                            for stmt in &block.block.stmts {
-                                syn::visit::visit_stmt(self, stmt);
-                            }
-                            self.nesting -= 1;
-                        }
-                        _ => {
-                            syn::visit::visit_expr(self, else_expr);
-                        }
-                    }
-                }
-                return; // We handled children manually
+                self.handle_if_expr(expr_if);
+                return;
             }
             Expr::Match(m) => {
-                self.increment();
-                self.nesting += 1;
-                for arm in &m.arms {
-                    if arm.guard.is_some() {
-                        self.increment_no_nesting();
-                    }
-                    syn::visit::visit_expr(self, &arm.body);
-                }
-                self.nesting -= 1;
+                self.handle_match_expr(m);
                 return;
             }
             Expr::ForLoop(_) | Expr::While(_) | Expr::Loop(_) => {
-                self.increment();
-                self.nesting += 1;
-                syn::visit::visit_expr(self, expr);
-                self.nesting -= 1;
+                self.handle_loop_expr(expr);
                 return;
             }
             Expr::Break(_) | Expr::Continue(_) => {
@@ -464,23 +495,11 @@ fn strip_project_path(path: &str, project_path: &Path) -> String {
     stripped.to_string()
 }
 
-/// Render the complexity subcommand output.
-pub fn render_complexity(symbols: &ProjectSymbols, project_path: &Path, verbose: bool) {
-    let func_complexities = compute_all(symbols, project_path);
-
-    if func_complexities.is_empty() {
-        println!("{}", "No functions found to analyze.".yellow());
-        return;
-    }
-
-    let file_complexities = compute_file_complexity(symbols, &func_complexities, project_path);
-    let stats = compute_stats(&func_complexities);
-    let term_w = render::terminal_width();
-
-    // Section 1: Top complex functions
+/// Render the function complexity rankings table.
+fn render_function_rankings(func_complexities: &[FunctionComplexity], _term_w: usize, verbose: bool) {
     println!(
         "\n{}",
-        "── Function Complexity Rankings ────────────────────────"
+        "\u{2500}\u{2500} Function Complexity Rankings \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
             .bright_cyan()
             .bold()
     );
@@ -496,7 +515,7 @@ pub fn render_complexity(symbols: &ProjectSymbols, project_path: &Path, verbose:
             "  Nest = deepest nesting depth in the function body.",
             "  Gen  = generic complexity = type params + trait bounds + where predicates.",
             "  Param = parameter count + return type complexity.",
-            "  Score = composite: 1.0×Cycl + 0.5×Cogn + 0.3×Nest + 0.2×Gen + 0.1×Param.",
+            "  Score = composite: 1.0\u{00d7}Cycl + 0.5\u{00d7}Cogn + 0.3\u{00d7}Nest + 0.2\u{00d7}Gen + 0.1\u{00d7}Param.",
             "Color: red = highest score, green = lowest. Functions sorted descending by Score.",
         ]);
         render::guide_ref("complexity");
@@ -554,11 +573,13 @@ pub fn render_complexity(symbols: &ProjectSymbols, project_path: &Path, verbose:
             .dimmed()
         );
     }
+}
 
-    // Section 2: Per-file complexity bar chart
+/// Render the per-file complexity bar chart.
+fn render_file_complexity_chart(file_complexities: &[FileComplexity], term_w: usize, verbose: bool) {
     println!(
         "\n{}",
-        "── Per-File Complexity ─────────────────────────────────"
+        "\u{2500}\u{2500} Per-File Complexity \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
             .bright_cyan()
             .bold()
     );
@@ -589,7 +610,7 @@ pub fn render_complexity(symbols: &ProjectSymbols, project_path: &Path, verbose:
     let score_digits = format!("{:.1}", max_score).len();
     let bar_budget = term_w
         .saturating_sub(max_label_len)
-        .saturating_sub(3) // " │ "
+        .saturating_sub(3) // " \u{2502} "
         .saturating_sub(score_digits)
         .saturating_sub(2)
         .max(10);
@@ -610,11 +631,11 @@ pub fn render_complexity(symbols: &ProjectSymbols, project_path: &Path, verbose:
         }
         .max(if fc.total_complexity > 0.0 { 1 } else { 0 });
 
-        let bar_str = "█".repeat(bar_len);
+        let bar_str = "\u{2588}".repeat(bar_len);
         let colored_bar = render::bar_color(&bar_str, ratio);
 
         println!(
-            "{:>width$} │ {}{} {}",
+            "{:>width$} \u{2502} {}{} {}",
             label.dimmed(),
             colored_bar,
             " ".repeat(bar_budget.saturating_sub(bar_len)),
@@ -633,31 +654,52 @@ pub fn render_complexity(symbols: &ProjectSymbols, project_path: &Path, verbose:
             .dimmed()
         );
     }
+}
 
-    // Section 3: Stats
-    if let Some(stats) = stats {
-        println!(
-            "\n{}",
-            "── Complexity Statistics ───────────────────────────────"
-                .bright_cyan()
-                .bold()
-        );
+/// Render the aggregate complexity statistics box.
+fn render_complexity_stats(stats: &ComplexityStats, verbose: bool) {
+    println!(
+        "\n{}",
+        "\u{2500}\u{2500} Complexity Statistics \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
+            .bright_cyan()
+            .bold()
+    );
 
-        if verbose {
-            render::verbose_block(&[
-                "Aggregate statistics for composite complexity across all functions.",
-                "Mean = average score. Std Dev = spread. Median = middle value (robust to outliers).",
-                "Max = highest individual function score in the project.",
-            ]);
-        }
+    if verbose {
+        render::verbose_block(&[
+            "Aggregate statistics for composite complexity across all functions.",
+            "Mean = average score. Std Dev = spread. Median = middle value (robust to outliers).",
+            "Max = highest individual function score in the project.",
+        ]);
+    }
 
-        println!("┌──────────────────┬──────────────┐");
-        render::print_stat_row_wide("Total functions", &format!("{}", stats.total_functions));
-        render::print_stat_row_wide("Mean score", &format!("{:.2}", stats.mean));
-        render::print_stat_row_wide("Std Dev", &format!("{:.2}", stats.std_dev));
-        render::print_stat_row_wide("Median score", &format!("{:.2}", stats.median));
-        render::print_stat_row_wide("Max score", &format!("{:.2}", stats.max));
-        println!("└──────────────────┴──────────────┘");
+    println!("\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{252c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}");
+    render::print_stat_row_wide("Total functions", &format!("{}", stats.total_functions));
+    render::print_stat_row_wide("Mean score", &format!("{:.2}", stats.mean));
+    render::print_stat_row_wide("Std Dev", &format!("{:.2}", stats.std_dev));
+    render::print_stat_row_wide("Median score", &format!("{:.2}", stats.median));
+    render::print_stat_row_wide("Max score", &format!("{:.2}", stats.max));
+    println!("\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2534}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}");
+}
+
+/// Render the complexity subcommand output.
+pub fn render_complexity(symbols: &ProjectSymbols, project_path: &Path, verbose: bool) {
+    let func_complexities = compute_all(symbols, project_path);
+
+    if func_complexities.is_empty() {
+        println!("{}", "No functions found to analyze.".yellow());
+        return;
+    }
+
+    let file_complexities = compute_file_complexity(symbols, &func_complexities, project_path);
+    let stats = compute_stats(&func_complexities);
+    let term_w = render::terminal_width();
+
+    render_function_rankings(&func_complexities, term_w, verbose);
+    render_file_complexity_chart(&file_complexities, term_w, verbose);
+
+    if let Some(ref stats) = stats {
+        render_complexity_stats(stats, verbose);
     }
 
     println!();
@@ -717,3 +759,12 @@ pub fn render_complexity_json(symbols: &ProjectSymbols, project_path: &Path) {
     println!("{}", serde_json::to_string(&output).unwrap());
 }
 
+
+pub fn run(rs_files: &[std::path::PathBuf], project_path: &Path, json: bool, verbose: bool) {
+    let symbols = crate::ast_parser::parse_project(rs_files);
+    if json {
+        render_complexity_json(&symbols, project_path);
+    } else {
+        render_complexity(&symbols, project_path, verbose);
+    }
+}

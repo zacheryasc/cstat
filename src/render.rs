@@ -161,3 +161,13 @@ pub fn guide_ref(topic: &str) {
     println!("  {}", format!("ℹ See: cstat guide {}", topic).dimmed());
     println!();
 }
+
+/// Print a section header with a decorative line.
+pub fn section_header(title: &str) {
+    use colored::Colorize;
+    println!(
+        "\n┌─ {} {}",
+        title.bright_cyan().bold(),
+        "─".repeat(50usize.saturating_sub(title.len() + 3)).bright_cyan(),
+    );
+}

@@ -55,6 +55,40 @@ struct LocJson {
     directory_breakdown: Vec<DirBreakdownJson>,
 }
 
+/// Classify a single trimmed line as code or non-code, tracking block comment state.
+/// Returns `(is_code, new_in_block_comment)`.
+fn classify_line(trimmed: &str, in_block_comment: bool) -> (bool, bool) {
+    if in_block_comment {
+        if let Some(pos) = trimmed.find("*/") {
+            let after = trimmed[pos + 2..].trim();
+            let is_code = !after.is_empty() && !after.starts_with("//");
+            return (is_code, false);
+        }
+        return (false, true);
+    }
+
+    if trimmed.is_empty() || trimmed.starts_with("//") {
+        return (false, false);
+    }
+
+    if trimmed.starts_with("/*") {
+        if !trimmed.contains("*/") {
+            return (false, true);
+        }
+        // Single-line block comment like /* ... */
+        let after_close = if let Some(pos) = trimmed.find("*/") {
+            trimmed[pos + 2..].trim()
+        } else {
+            ""
+        };
+        if after_close.is_empty() {
+            return (false, false);
+        }
+    }
+
+    (true, false)
+}
+
 /// Count lines in a single file. Code lines exclude blank lines and comment-only lines.
 fn count_lines(path: &Path) -> Option<FileLocStats> {
     let content = std::fs::read_to_string(path).ok()?;
@@ -63,45 +97,11 @@ fn count_lines(path: &Path) -> Option<FileLocStats> {
     let mut in_block_comment = false;
 
     for line in content.lines() {
-        let trimmed = line.trim();
-
-        if in_block_comment {
-            if let Some(pos) = trimmed.find("*/") {
-                in_block_comment = false;
-                // Check if there's code after the block comment end
-                let after = trimmed[pos + 2..].trim();
-                if !after.is_empty() && !after.starts_with("//") {
-                    code_lines += 1;
-                }
-            }
-            continue;
+        let (is_code, new_in_block) = classify_line(line.trim(), in_block_comment);
+        in_block_comment = new_in_block;
+        if is_code {
+            code_lines += 1;
         }
-
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed.starts_with("//") {
-            continue;
-        }
-
-        if trimmed.starts_with("/*") {
-            if !trimmed.contains("*/") {
-                in_block_comment = true;
-                continue;
-            }
-            // Single-line block comment like /* ... */
-            let after_close = if let Some(pos) = trimmed.find("*/") {
-                trimmed[pos + 2..].trim()
-            } else {
-                ""
-            };
-            if after_close.is_empty() {
-                continue;
-            }
-        }
-
-        code_lines += 1;
     }
 
     Some(FileLocStats {
@@ -169,6 +169,70 @@ fn strip_prefix<'a>(path: &'a Path, base: &Path) -> &'a Path {
     path.strip_prefix(base).unwrap_or(path)
 }
 
+/// Render a bar chart of LoC per file.
+fn render_loc_bar_chart(
+    display_stats: &[FileLocStats],
+    labels: &[String],
+    max_label_len: usize,
+    max_loc: usize,
+    bar_budget: usize,
+) {
+    let display_count = display_stats.len();
+    for (i, (stat, label)) in display_stats.iter().zip(labels.iter()).enumerate() {
+        let ratio = i as f64 / display_count.max(1) as f64;
+        let bar_len = if max_loc > 0 {
+            (stat.code_lines as f64 / max_loc as f64 * bar_budget as f64).ceil() as usize
+        } else {
+            0
+        }
+        .max(if stat.code_lines > 0 { 1 } else { 0 });
+
+        let bar_str = "█".repeat(bar_len);
+        let colored_bar = render::bar_color(&bar_str, ratio);
+
+        println!(
+            "{:>width$} │ {}{} {}",
+            label.dimmed(),
+            colored_bar,
+            " ".repeat(bar_budget.saturating_sub(bar_len)),
+            format!("{}", stat.code_lines).bold(),
+            width = max_label_len,
+        );
+    }
+}
+
+/// Render the statistics summary box.
+fn render_loc_stats_box(agg: &AggregateStats, verbose: bool) {
+    println!(
+        "\n{}",
+        "── Statistics ─────────────────────────────────────────────"
+            .bright_cyan()
+            .bold()
+    );
+
+    if verbose {
+        render::verbose_block(&[
+            "Descriptive statistics across all analyzed files.",
+            "Mean = average LoC per file. Std Dev = spread around the mean.",
+            "Median = middle value when files are sorted by LoC (robust to outliers).",
+        ]);
+    }
+
+    println!(
+        "┌─────────────┬──────────────┐"
+    );
+    render::print_stat_row("Total files", &format!("{}", agg.total_files));
+    render::print_stat_row("Total LoC", &format!("{}", agg.total_loc));
+    render::print_stat_row("Mean", &format!("{:.1}", agg.mean));
+    render::print_stat_row("Std Dev", &format!("{:.1}", agg.std_dev));
+    render::print_stat_row("Median", &format!("{}", agg.median));
+    render::print_stat_row("Min", &format!("{}", agg.min));
+    render::print_stat_row("Max", &format!("{}", agg.max));
+    println!(
+        "└─────────────┴──────────────┘"
+    );
+}
+
 /// Render the full LoC analysis for the `loc` subcommand.
 pub fn render_loc(files: &[PathBuf], project_path: &Path, top_n: Option<usize>, verbose: bool) {
     let (file_stats, agg) = analyze_files(files);
@@ -198,7 +262,6 @@ pub fn render_loc(files: &[PathBuf], project_path: &Path, top_n: Option<usize>, 
         .unwrap_or(1);
     let loc_digits = format!("{}", max_loc).len();
 
-    // Bar area: terminal width - label - " │ " (3) - " " - loc_digits - 1 (space)
     let bar_budget = term_w
         .saturating_sub(max_label_len)
         .saturating_sub(3)
@@ -209,7 +272,7 @@ pub fn render_loc(files: &[PathBuf], project_path: &Path, top_n: Option<usize>, 
     // Header
     println!(
         "\n{}",
-        "── Lines of Code ──────────────────────────────────────"
+        "── Lines of Code ────────────────────────────────────────"
             .bright_cyan()
             .bold()
     );
@@ -230,27 +293,7 @@ pub fn render_loc(files: &[PathBuf], project_path: &Path, top_n: Option<usize>, 
     );
 
     // Bar chart
-    for (i, (stat, label)) in display_stats.iter().zip(labels.iter()).enumerate() {
-        let ratio = i as f64 / display_count.max(1) as f64;
-        let bar_len = if max_loc > 0 {
-            (stat.code_lines as f64 / max_loc as f64 * bar_budget as f64).ceil() as usize
-        } else {
-            0
-        }
-        .max(if stat.code_lines > 0 { 1 } else { 0 });
-
-        let bar_str = "█".repeat(bar_len);
-        let colored_bar = render::bar_color(&bar_str, ratio);
-
-        println!(
-            "{:>width$} │ {}{} {}",
-            label.dimmed(),
-            colored_bar,
-            " ".repeat(bar_budget.saturating_sub(bar_len)),
-            format!("{}", stat.code_lines).bold(),
-            width = max_label_len,
-        );
-    }
+    render_loc_bar_chart(display_stats, &labels, max_label_len, max_loc, bar_budget);
 
     if display_count < file_stats.len() {
         println!(
@@ -264,34 +307,7 @@ pub fn render_loc(files: &[PathBuf], project_path: &Path, top_n: Option<usize>, 
     }
 
     // Stats box
-    println!(
-        "\n{}",
-        "── Statistics ─────────────────────────────────────────"
-            .bright_cyan()
-            .bold()
-    );
-
-    if verbose {
-        render::verbose_block(&[
-            "Descriptive statistics across all analyzed files.",
-            "Mean = average LoC per file. Std Dev = spread around the mean.",
-            "Median = middle value when files are sorted by LoC (robust to outliers).",
-        ]);
-    }
-
-    println!(
-        "┌─────────────┬──────────────┐"
-    );
-    render::print_stat_row("Total files", &format!("{}", agg.total_files));
-    render::print_stat_row("Total LoC", &format!("{}", agg.total_loc));
-    render::print_stat_row("Mean", &format!("{:.1}", agg.mean));
-    render::print_stat_row("Std Dev", &format!("{:.1}", agg.std_dev));
-    render::print_stat_row("Median", &format!("{}", agg.median));
-    render::print_stat_row("Min", &format!("{}", agg.min));
-    render::print_stat_row("Max", &format!("{}", agg.max));
-    println!(
-        "└─────────────┴──────────────┘"
-    );
+    render_loc_stats_box(&agg, verbose);
 
     // Treemap visualization
     render_treemap(&file_stats, project_path, verbose);

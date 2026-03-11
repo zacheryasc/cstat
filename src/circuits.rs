@@ -11,6 +11,39 @@ use crate::render;
 /// Detect communities in the call graph using label propagation.
 /// Each function gets a label (initially its own index). Iteratively,
 /// each node adopts the most frequent label among its neighbors.
+
+/// Collect label frequency counts from a node's neighbors in both directions.
+/// Returns a map of label -> occurrence count across all adjacent nodes.
+fn collect_neighbor_labels(
+    node: &str,
+    adj: &HashMap<String, Vec<String>>,
+    rev_adj: &HashMap<String, Vec<String>>,
+    node_idx: &HashMap<&str, usize>,
+    labels: &[usize],
+) -> HashMap<usize, usize> {
+    let mut label_counts: HashMap<usize, usize> = HashMap::new();
+
+    if let Some(succs) = adj.get(node) {
+        for s in succs {
+            if let Some(&idx) = node_idx.get(s.as_str()) {
+                *label_counts.entry(labels[idx]).or_insert(0) += 1;
+            }
+        }
+    }
+    if let Some(preds) = rev_adj.get(node) {
+        for p in preds {
+            if let Some(&idx) = node_idx.get(p.as_str()) {
+                *label_counts.entry(labels[idx]).or_insert(0) += 1;
+            }
+        }
+    }
+
+    label_counts
+}
+
+/// Detect communities in the call graph using label propagation.
+/// Each function gets a label (initially its own index). Iteratively,
+/// each node adopts the most frequent label among its neighbors.
 /// Converges when labels stabilize.
 fn label_propagation(
     nodes: &[String],
@@ -22,7 +55,11 @@ fn label_propagation(
         return vec![];
     }
 
-    let node_idx: HashMap<&str, usize> = nodes.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let node_idx: HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
     let mut labels: Vec<usize> = (0..n).collect();
 
     // Create a deterministic node ordering for iteration (sorted by name)
@@ -35,25 +72,7 @@ fn label_propagation(
         let mut changed = false;
 
         for &i in &order {
-            let node = &nodes[i];
-
-            // Collect neighbor labels (both directions for undirected community detection)
-            let mut label_counts: HashMap<usize, usize> = HashMap::new();
-
-            if let Some(succs) = adj.get(node.as_str()) {
-                for s in succs {
-                    if let Some(&idx) = node_idx.get(s.as_str()) {
-                        *label_counts.entry(labels[idx]).or_insert(0) += 1;
-                    }
-                }
-            }
-            if let Some(preds) = rev_adj.get(node.as_str()) {
-                for p in preds {
-                    if let Some(&idx) = node_idx.get(p.as_str()) {
-                        *label_counts.entry(labels[idx]).or_insert(0) += 1;
-                    }
-                }
-            }
+            let label_counts = collect_neighbor_labels(&nodes[i], adj, rev_adj, &node_idx, &labels);
 
             if label_counts.is_empty() {
                 continue;
@@ -82,7 +101,10 @@ fn label_propagation(
     // Group nodes by label
     let mut communities: HashMap<usize, Vec<String>> = HashMap::new();
     for (i, label) in labels.iter().enumerate() {
-        communities.entry(*label).or_default().push(nodes[i].clone());
+        communities
+            .entry(*label)
+            .or_default()
+            .push(nodes[i].clone());
     }
 
     let mut result: Vec<Vec<String>> = communities.into_values().collect();
@@ -156,30 +178,14 @@ fn compute_modularity(
     q / m_f
 }
 
-/// Run full circuit analysis on the call graph.
-fn analyze_circuits(cg: &flow::CallGraph, min_size: usize) -> CircuitAnalysis {
-    // Build reverse adjacency
-    let mut rev_adj: HashMap<String, Vec<String>> = HashMap::new();
-    for f in &cg.functions {
-        rev_adj.entry(f.clone()).or_default();
-    }
-    for (caller, callees) in &cg.adjacency {
-        for callee in callees {
-            rev_adj.entry(callee.clone()).or_default().push(caller.clone());
-        }
-    }
-
-    let communities = label_propagation(&cg.functions, &cg.adjacency, &rev_adj);
-
-    // Build partition map: node -> circuit index
-    let mut partition: HashMap<String, usize> = HashMap::new();
-    for (ci, community) in communities.iter().enumerate() {
-        for node in community {
-            partition.insert(node.clone(), ci);
-        }
-    }
-
-    // For each circuit, compute boundary functions, internal edges, cohesion
+/// Build Circuit structs from detected communities, computing boundary
+/// functions, internal edges, and cohesion for each circuit.
+fn build_circuits(
+    communities: &[Vec<String>],
+    cg: &flow::CallGraph,
+    rev_adj: &HashMap<String, Vec<String>>,
+    partition: &HashMap<String, usize>,
+) -> Vec<Circuit> {
     let mut circuits: Vec<Circuit> = Vec::new();
     for (ci, community) in communities.iter().enumerate() {
         let member_set: HashSet<&str> = community.iter().map(|s| s.as_str()).collect();
@@ -187,14 +193,11 @@ fn analyze_circuits(cg: &flow::CallGraph, min_size: usize) -> CircuitAnalysis {
         // Boundary functions: called from outside the circuit
         let mut boundary_fns = Vec::new();
         for member in community {
-            // Check if any caller is outside this circuit
-            let is_boundary = rev_adj
-                .get(member.as_str())
-                .map_or(false, |callers| {
-                    callers.iter().any(|c| {
-                        partition.get(c.as_str()).copied().unwrap_or(ci) != ci
-                    })
-                });
+            let is_boundary = rev_adj.get(member.as_str()).map_or(false, |callers| {
+                callers
+                    .iter()
+                    .any(|c| partition.get(c.as_str()).copied().unwrap_or(ci) != ci)
+            });
             if is_boundary {
                 boundary_fns.push(member.clone());
             }
@@ -225,8 +228,15 @@ fn analyze_circuits(cg: &flow::CallGraph, min_size: usize) -> CircuitAnalysis {
             cohesion,
         });
     }
+    circuits
+}
 
-    // Inter-circuit edges: count edges between each pair of circuits
+/// Compute inter-circuit edges: count directed call edges between each
+/// pair of circuits, returned sorted by weight (heaviest first).
+fn compute_inter_circuit_edges(
+    cg: &flow::CallGraph,
+    partition: &HashMap<String, usize>,
+) -> Vec<(usize, usize, usize)> {
     let mut inter_edges: HashMap<(usize, usize), usize> = HashMap::new();
     for (caller, callees) in &cg.adjacency {
         let c_from = match partition.get(caller.as_str()) {
@@ -244,17 +254,49 @@ fn analyze_circuits(cg: &flow::CallGraph, min_size: usize) -> CircuitAnalysis {
         }
     }
 
-    let mut inter_circuit_edges: Vec<(usize, usize, usize)> = inter_edges
+    let mut result: Vec<(usize, usize, usize)> = inter_edges
         .into_iter()
         .map(|((a, b), w)| (a, b, w))
         .collect();
-    inter_circuit_edges.sort_by(|a, b| b.2.cmp(&a.2));
+    result.sort_by(|a, b| b.2.cmp(&a.2));
+    result
+}
 
-    // Modularity
+/// Run full circuit analysis on the call graph.
+fn analyze_circuits(cg: &flow::CallGraph, min_size: usize) -> CircuitAnalysis {
+    // Build reverse adjacency
+    let mut rev_adj: HashMap<String, Vec<String>> = HashMap::new();
+    for f in &cg.functions {
+        rev_adj.entry(f.clone()).or_default();
+    }
+    for (caller, callees) in &cg.adjacency {
+        for callee in callees {
+            rev_adj
+                .entry(callee.clone())
+                .or_default()
+                .push(caller.clone());
+        }
+    }
+
+    let communities = label_propagation(&cg.functions, &cg.adjacency, &rev_adj);
+
+    // Build partition map: node -> circuit index
+    let mut partition: HashMap<String, usize> = HashMap::new();
+    for (ci, community) in communities.iter().enumerate() {
+        for node in community {
+            partition.insert(node.clone(), ci);
+        }
+    }
+
+    let circuits = build_circuits(&communities, cg, &rev_adj, &partition);
+    let inter_circuit_edges = compute_inter_circuit_edges(cg, &partition);
     let modularity = compute_modularity(&cg.functions, &cg.adjacency, &partition);
 
     // Filter by min_size
-    let filtered_circuits: Vec<Circuit> = circuits.into_iter().filter(|c| c.members.len() >= min_size).collect();
+    let filtered_circuits: Vec<Circuit> = circuits
+        .into_iter()
+        .filter(|c| c.members.len() >= min_size)
+        .collect();
 
     CircuitAnalysis {
         circuits: filtered_circuits,
@@ -262,8 +304,6 @@ fn analyze_circuits(cg: &flow::CallGraph, min_size: usize) -> CircuitAnalysis {
         modularity,
     }
 }
-
-// ── Rendering ────────────────────────────────────────────────────
 
 fn render_overview(analysis: &CircuitAnalysis, total_functions: usize, verbose: bool) {
     println!(
@@ -323,9 +363,15 @@ fn render_overview(analysis: &CircuitAnalysis, total_functions: usize, verbose: 
         "  │ {:<18} {:>17} │",
         "Modularity (Q)".cyan(),
         if analysis.modularity > 0.0 {
-            format!("{:.4}", analysis.modularity).green().bold().to_string()
+            format!("{:.4}", analysis.modularity)
+                .green()
+                .bold()
+                .to_string()
         } else {
-            format!("{:.4}", analysis.modularity).red().bold().to_string()
+            format!("{:.4}", analysis.modularity)
+                .red()
+                .bold()
+                .to_string()
         }
     );
     println!("  └──────────────────────────────────────┘");
@@ -392,17 +438,9 @@ fn render_circuit_details(analysis: &CircuitAnalysis, verbose: bool) {
 
         for member in &circuit.members {
             if boundary_set.contains(member.as_str()) {
-                println!(
-                    "    {} {}",
-                    "◆".bright_blue(),
-                    member.bright_white(),
-                );
+                println!("    {} {}", "◆".bright_blue(), member.bright_white(),);
             } else {
-                println!(
-                    "    {} {}",
-                    "·".dimmed(),
-                    member.dimmed(),
-                );
+                println!("    {} {}", "·".dimmed(), member.dimmed(),);
             }
         }
 
@@ -565,12 +603,7 @@ pub fn circuit_summary(rs_files: &[PathBuf], project_path: &Path) -> Option<Circ
 
 // ── Public entry point ───────────────────────────────────────────
 
-pub fn render_circuits(
-    rs_files: &[PathBuf],
-    project_path: &Path,
-    min_size: usize,
-    verbose: bool,
-) {
+pub fn render_circuits(rs_files: &[PathBuf], project_path: &Path, min_size: usize, verbose: bool) {
     let cg = flow::build_call_graph(rs_files, project_path);
 
     if cg.functions.is_empty() {
@@ -582,7 +615,10 @@ pub fn render_circuits(
     let analysis = analyze_circuits(&cg, min_size);
 
     if analysis.circuits.is_empty() {
-        println!("{}", "No circuits found (try lowering --min-size).".yellow());
+        println!(
+            "{}",
+            "No circuits found (try lowering --min-size).".yellow()
+        );
         return;
     }
 
@@ -615,11 +651,7 @@ struct CircuitsOutputJson {
 }
 
 /// Render circuits analysis as JSON.
-pub fn render_circuits_json(
-    rs_files: &[PathBuf],
-    project_path: &Path,
-    min_size: usize,
-) {
+pub fn render_circuits_json(rs_files: &[PathBuf], project_path: &Path, min_size: usize) {
     let cg = flow::build_call_graph(rs_files, project_path);
     let analysis = analyze_circuits(&cg, min_size);
 
