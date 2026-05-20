@@ -1,0 +1,10 @@
+[package]
+name = "cstat-schema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Output envelope and identity types for cstat (Milestone 1 §5–§7)."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

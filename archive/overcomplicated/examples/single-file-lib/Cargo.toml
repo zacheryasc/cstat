@@ -1,0 +1,8 @@
+[package]
+name = "single-file-lib"
+version = "0.1.0"
+edition = "2021"
+description = "Worked example from spec §13. Used as the canonical fixture."
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,13 @@
+[package]
+name = "cstat-orchestrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Level trait, runner, and output assembly."
+
+[dependencies]
+cstat-schema = { path = "../cstat-schema" }
+cstat-ir = { path = "../cstat-ir" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

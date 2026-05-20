@@ -1,0 +1,10 @@
+[package]
+name = "cstat-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stable mirror types for HIR/THIR/MIR/borrowck/mono-items."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

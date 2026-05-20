@@ -1,1 +1,5 @@
-/target
+.loop/
+.loop/.stash/
+.mono/
+target/
+/demo_glossary
