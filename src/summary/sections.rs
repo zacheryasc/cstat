@@ -39,10 +39,22 @@ pub(super) fn sparkline(values: &[f64]) -> String {
 /// Render single-line sparkline distributions for key metrics.
 pub(super) fn render_sparkline_distributions(fcs: &[complexity::FunctionComplexity]) {
     let metrics: Vec<(&str, Vec<f64>)> = vec![
-        ("Function LoC", fcs.iter().map(|f| f.line_count as f64).collect()),
-        ("Cyclomatic", fcs.iter().map(|f| f.cyclomatic as f64).collect()),
-        ("Cognitive", fcs.iter().map(|f| f.cognitive as f64).collect()),
-        ("Nesting", fcs.iter().map(|f| f.nesting_depth as f64).collect()),
+        (
+            "Function LoC",
+            fcs.iter().map(|f| f.line_count as f64).collect(),
+        ),
+        (
+            "Cyclomatic",
+            fcs.iter().map(|f| f.cyclomatic as f64).collect(),
+        ),
+        (
+            "Cognitive",
+            fcs.iter().map(|f| f.cognitive as f64).collect(),
+        ),
+        (
+            "Nesting",
+            fcs.iter().map(|f| f.nesting_depth as f64).collect(),
+        ),
         ("Params", fcs.iter().map(|f| f.param_count as f64).collect()),
     ];
 
@@ -69,7 +81,11 @@ pub(super) fn render_sparkline_distributions(fcs: &[complexity::FunctionComplexi
 /// Render graph centrality highlights.
 pub(super) fn render_graph_centrality(gs: &graph::GraphSummary) {
     if let Some((name, val)) = &gs.top_bridge {
-        let short = if name.len() > 30 { &name[name.len() - 30..] } else { name.as_str() };
+        let short = if name.len() > 30 {
+            &name[name.len() - 30..]
+        } else {
+            name.as_str()
+        };
         println!(
             "  {} {} (bc={:.4})",
             "Top bridge:".bold(),
@@ -78,16 +94,19 @@ pub(super) fn render_graph_centrality(gs: &graph::GraphSummary) {
         );
     }
     if let Some((name, val)) = &gs.top_hub {
-        let short = if name.len() > 30 { &name[name.len() - 30..] } else { name.as_str() };
-        println!(
-            "  {} {} (pr={:.4})",
-            "Top hub:".bold(),
-            short.yellow(),
-            val,
-        );
+        let short = if name.len() > 30 {
+            &name[name.len() - 30..]
+        } else {
+            name.as_str()
+        };
+        println!("  {} {} (pr={:.4})", "Top hub:".bold(), short.yellow(), val,);
     }
     if let Some((name, val)) = &gs.top_clustered {
-        let short = if name.len() > 30 { &name[name.len() - 30..] } else { name.as_str() };
+        let short = if name.len() > 30 {
+            &name[name.len() - 30..]
+        } else {
+            name.as_str()
+        };
         println!(
             "  {} {} (cc={:.4})",
             "Most clustered:".bold(),
@@ -103,9 +122,15 @@ pub(super) fn render_graph_centrality(gs: &graph::GraphSummary) {
 /// Render datapath coverage section.
 pub(super) fn render_datapath_coverage(ds: &datapaths::DatapathSummary) {
     let coverage_color = if ds.coverage_pct > 80.0 {
-        format!("{:.1}%", ds.coverage_pct).green().bold().to_string()
+        format!("{:.1}%", ds.coverage_pct)
+            .green()
+            .bold()
+            .to_string()
     } else if ds.coverage_pct > 50.0 {
-        format!("{:.1}%", ds.coverage_pct).yellow().bold().to_string()
+        format!("{:.1}%", ds.coverage_pct)
+            .yellow()
+            .bold()
+            .to_string()
     } else {
         format!("{:.1}%", ds.coverage_pct).red().bold().to_string()
     };
@@ -159,32 +184,20 @@ pub(super) fn render_circuit_overview(cs: &circuits::CircuitSummary) {
     } else {
         format!("{:.4}", cs.modularity).red().to_string()
     };
-    println!(
-        "  {} {}",
-        "Modularity:".bold(),
-        mod_color,
-    );
+    println!("  {} {}", "Modularity:".bold(), mod_color,);
 
     if !cs.sizes.is_empty() {
         let max_s = cs.sizes.iter().max().unwrap_or(&0);
         let min_s = cs.sizes.iter().min().unwrap_or(&0);
         let avg_s = cs.sizes.iter().sum::<usize>() as f64 / cs.sizes.len() as f64;
-        println!(
-            "  Sizes: {}–{} (avg {:.1})",
-            min_s, max_s, avg_s,
-        );
+        println!("  Sizes: {}–{} (avg {:.1})", min_s, max_s, avg_s,);
     }
 }
 
 pub(super) fn print_stat(label: &str, value: &str, box_w: usize) {
     let inner = box_w - 2;
     let val_w = inner.saturating_sub(label.len() + 3);
-    println!(
-        "  │ {} {:>w$} │",
-        label.cyan(),
-        value.bold(),
-        w = val_w,
-    );
+    println!("  │ {} {:>w$} │", label.cyan(), value.bold(), w = val_w,);
 }
 
 pub(super) fn short_path(path: &Path, base: &Path) -> String {
@@ -237,7 +250,12 @@ pub(super) fn render_mini_heatmap(analysis: &deps::DepAnalysis, term_w: usize) {
         .iter()
         .map(|m| m.rsplit("::").next().unwrap_or(m))
         .collect();
-    let max_short = short_names.iter().map(|s| s.len()).max().unwrap_or(3).min(12);
+    let max_short = short_names
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(3)
+        .min(12);
 
     let matrix_cols = max_short + 3 + n * 2 + 4;
     if matrix_cols > term_w {
@@ -275,12 +293,7 @@ pub(super) fn render_mini_heatmap(analysis: &deps::DepAnalysis, term_w: usize) {
         println!("{}", format!("{}", ri).dimmed());
     }
 
-    println!(
-        "  {} {} {}",
-        "0".dimmed(),
-        "1".yellow(),
-        "2".red().bold(),
-    );
+    println!("  {} {} {}", "0".dimmed(), "1".yellow(), "2".red().bold(),);
     println!();
 }
 
@@ -299,10 +312,7 @@ pub(super) fn render_dir_breakdown(
 
     let mut dir_loc: BTreeMap<String, usize> = BTreeMap::new();
     for stat in file_stats {
-        let rel = stat
-            .path
-            .strip_prefix(project_path)
-            .unwrap_or(&stat.path);
+        let rel = stat.path.strip_prefix(project_path).unwrap_or(&stat.path);
         let components: Vec<_> = rel.components().collect();
         let dir_name = if components.len() <= 1 {
             ".".to_string()

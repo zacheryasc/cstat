@@ -75,8 +75,7 @@ fn render_tier_modules(
             if let Some(mbox) = module_boxes.get(mod_name.as_str()) {
                 let is_hub = mbox.connectivity >= hub_threshold && hub_threshold > 0;
                 let height = proportional_height(mbox.code_lines, max_loc);
-                let lines =
-                    render_module_box(mbox, col_width.saturating_sub(1), is_hub, height);
+                let lines = render_module_box(mbox, col_width.saturating_sub(1), is_hub, height);
                 box_lines.push(lines);
             }
         }
@@ -123,8 +122,7 @@ fn render_tier_arrows(tier_edges: &[TierEdge], tier_idx: usize) {
             .entry((e.from_mod.as_str(), e.to_mod.as_str()))
             .or_insert(0) += 1;
     }
-    let mut arrow_list: Vec<((&str, &str), usize)> =
-        arrow_groups.into_iter().collect();
+    let mut arrow_list: Vec<((&str, &str), usize)> = arrow_groups.into_iter().collect();
     arrow_list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0 .0.cmp(b.0 .0)));
 
     let show_count = arrow_list.len().min(6);
@@ -213,8 +211,14 @@ fn prepare_map_data(
     // Sort modules within each tier by LoC descending
     for group in &mut tier_groups {
         group.sort_by(|a, b| {
-            let a_loc = module_boxes.get(a.as_str()).map(|m| m.code_lines).unwrap_or(0);
-            let b_loc = module_boxes.get(b.as_str()).map(|m| m.code_lines).unwrap_or(0);
+            let a_loc = module_boxes
+                .get(a.as_str())
+                .map(|m| m.code_lines)
+                .unwrap_or(0);
+            let b_loc = module_boxes
+                .get(b.as_str())
+                .map(|m| m.code_lines)
+                .unwrap_or(0);
             b_loc.cmp(&a_loc).then(a.cmp(b))
         });
     }
@@ -311,7 +315,13 @@ pub fn render_map(rs_files: &[PathBuf], project_path: &Path, verbose: bool) {
         }
 
         render_tier_header(tier_idx, data.max_tier, term_w);
-        render_tier_modules(group, &data.module_boxes, data.hub_threshold, data.max_loc, term_w);
+        render_tier_modules(
+            group,
+            &data.module_boxes,
+            data.hub_threshold,
+            data.max_loc,
+            term_w,
+        );
         render_tier_arrows(&data.tier_edges, tier_idx);
     }
 
@@ -336,8 +346,6 @@ pub fn render_map(rs_files: &[PathBuf], project_path: &Path, verbose: bool) {
     );
     println!();
 }
-
-
 
 /// Convert a file path like "src/foo.rs" to module name "foo".
 fn file_to_module_name(file: &str) -> String {
@@ -383,16 +391,8 @@ fn build_module_boxes(
             .cloned()
             .unwrap_or_default();
 
-        let in_d = dep_analysis
-            .in_degree
-            .get(&mod_name)
-            .copied()
-            .unwrap_or(0);
-        let out_d = dep_analysis
-            .out_degree
-            .get(&mod_name)
-            .copied()
-            .unwrap_or(0);
+        let in_d = dep_analysis.in_degree.get(&mod_name).copied().unwrap_or(0);
+        let out_d = dep_analysis.out_degree.get(&mod_name).copied().unwrap_or(0);
         let connectivity = in_d + out_d;
 
         boxes.insert(
@@ -698,10 +698,11 @@ fn render_module_box(
     let mut lines = Vec::new();
     lines.push(render_box_header(mbox, box_width, is_hub, h, tl, tr));
     let content = build_box_content(mbox, inner_w, prop_height);
-    lines.extend(render_box_body(&content, inner_w, box_width, is_hub, v, bl, br, h));
+    lines.extend(render_box_body(
+        &content, inner_w, box_width, is_hub, v, bl, br, h,
+    ));
     lines
 }
-
 
 /// Build a complexity heatbar from function scores.
 fn build_heatbar(scores: &[f64], max_width: usize) -> String {
@@ -815,11 +816,18 @@ pub fn render_map_json(rs_files: &[PathBuf], project_path: &Path) {
     let mut complexity_by_mod: HashMap<String, Vec<f64>> = HashMap::new();
     for fc in &func_complexities {
         let mod_name = file_to_module_name(&fc.file);
-        complexity_by_mod.entry(mod_name).or_default().push(fc.composite_score);
+        complexity_by_mod
+            .entry(mod_name)
+            .or_default()
+            .push(fc.composite_score);
     }
 
     let module_boxes = build_module_boxes(
-        &symbols, project_path, &loc_by_mod, &complexity_by_mod, &dep_analysis,
+        &symbols,
+        project_path,
+        &loc_by_mod,
+        &complexity_by_mod,
+        &dep_analysis,
     );
 
     let tiers = compute_tiers(&module_boxes, &dep_analysis);

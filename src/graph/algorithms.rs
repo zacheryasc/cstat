@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// A simple directed graph used for metric computation.
 pub(super) struct DiGraph {
     pub(super) nodes: Vec<String>,
-    pub(super) adj: HashMap<String, Vec<String>>,     // forward edges
+    pub(super) adj: HashMap<String, Vec<String>>, // forward edges
     pub(super) rev_adj: HashMap<String, Vec<String>>, // reverse edges
 }
 
@@ -21,7 +21,11 @@ impl DiGraph {
             adj.entry(from.clone()).or_default().push(to.clone());
             rev_adj.entry(to.clone()).or_default().push(from.clone());
         }
-        DiGraph { nodes, adj, rev_adj }
+        DiGraph {
+            nodes,
+            adj,
+            rev_adj,
+        }
     }
 
     pub(super) fn node_count(&self) -> usize {
@@ -153,7 +157,11 @@ fn bfs_shortest_paths(s: &str, graph: &DiGraph) -> BfsResult {
         }
     }
 
-    BfsResult { stack, predecessors, sigma }
+    BfsResult {
+        stack,
+        predecessors,
+        sigma,
+    }
 }
 
 /// Back-propagation: accumulate betweenness from dependency scores.
@@ -211,11 +219,7 @@ pub(super) fn pagerank(graph: &DiGraph, damping: f64, iterations: usize) -> Hash
         return HashMap::new();
     }
     let initial = 1.0 / n as f64;
-    let mut rank: HashMap<String, f64> = graph
-        .nodes
-        .iter()
-        .map(|n| (n.clone(), initial))
-        .collect();
+    let mut rank: HashMap<String, f64> = graph.nodes.iter().map(|n| (n.clone(), initial)).collect();
 
     for _ in 0..iterations {
         let mut new_rank: HashMap<String, f64> = HashMap::new();
@@ -236,8 +240,8 @@ pub(super) fn pagerank(graph: &DiGraph, damping: f64, iterations: usize) -> Hash
                     incoming_sum += rank[pred] / out_deg as f64;
                 }
             }
-            let pr = (1.0 - damping) / n as f64
-                + damping * (incoming_sum + dangling_sum / n as f64);
+            let pr =
+                (1.0 - damping) / n as f64 + damping * (incoming_sum + dangling_sum / n as f64);
             new_rank.insert(node.clone(), pr);
         }
         rank = new_rank;
@@ -367,11 +371,7 @@ fn compute_distances(graph: &DiGraph) -> (Option<usize>, f64) {
 
 /// BFS traversal for one weak component starting at `start`.
 /// Visits all nodes reachable via forward or reverse edges, marking them in `visited`.
-fn bfs_weak_component<'a>(
-    start: &'a str,
-    graph: &'a DiGraph,
-    visited: &mut HashSet<&'a str>,
-) {
+fn bfs_weak_component<'a>(start: &'a str, graph: &'a DiGraph, visited: &mut HashSet<&'a str>) {
     let mut queue: VecDeque<&str> = VecDeque::new();
     queue.push_back(start);
     visited.insert(start);

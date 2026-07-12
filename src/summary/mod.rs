@@ -41,7 +41,15 @@ pub fn render_summary(rs_files: &[PathBuf], project_path: &Path, verbose: bool) 
     let total_modules = dep_analysis.modules.len();
 
     // ── Render each section ──────────────────────────────────
-    render_summary_header(&project_name, total_files, total_loc, total_functions, total_modules, term_w, verbose);
+    render_summary_header(
+        &project_name,
+        total_files,
+        total_loc,
+        total_functions,
+        total_modules,
+        term_w,
+        verbose,
+    );
     render_loc_section(&file_stats, &project_path_canon, term_w, total_loc, verbose);
     render_complexity_section(&func_complexities, verbose);
     render_connectome_section(&dep_analysis, term_w, verbose);
@@ -49,7 +57,14 @@ pub fn render_summary(rs_files: &[PathBuf], project_path: &Path, verbose: bool) 
     render_centrality_section(rs_files, &project_path_canon, verbose);
     render_datapath_section(rs_files, &project_path_canon, verbose);
     render_circuits_section(rs_files, &project_path_canon, verbose);
-    render_stats_footer(&agg_loc, &complexity_stats, total_files, total_functions, total_modules, verbose);
+    render_stats_footer(
+        &agg_loc,
+        &complexity_stats,
+        total_files,
+        total_functions,
+        total_modules,
+        verbose,
+    );
 }
 
 /// Render the dashboard header banner.
@@ -126,11 +141,7 @@ fn render_loc_section(
 }
 
 /// Render the LoC bar chart for up to 10 files.
-fn render_loc_bars(
-    file_stats: &[loc::FileLocStats],
-    project_path_canon: &Path,
-    term_w: usize,
-) {
+fn render_loc_bars(file_stats: &[loc::FileLocStats], project_path_canon: &Path, term_w: usize) {
     let display_count = file_stats.len().min(10);
     let display_stats = &file_stats[..display_count];
     let max_label_len = display_stats
@@ -183,10 +194,7 @@ fn render_loc_bars(
 }
 
 /// Render the complexity hotspots table.
-fn render_complexity_section(
-    func_complexities: &[complexity::FunctionComplexity],
-    verbose: bool,
-) {
+fn render_complexity_section(func_complexities: &[complexity::FunctionComplexity], verbose: bool) {
     render::section_header("Complexity Hotspots");
 
     if verbose {
@@ -246,11 +254,7 @@ fn render_complexity_section(
 }
 
 /// Render the module connectome heatmap and coupling statistics.
-fn render_connectome_section(
-    dep_analysis: &deps::DepAnalysis,
-    term_w: usize,
-    verbose: bool,
-) {
+fn render_connectome_section(dep_analysis: &deps::DepAnalysis, term_w: usize, verbose: bool) {
     render::section_header("Module Connectome");
 
     if verbose {
@@ -359,11 +363,7 @@ fn render_distributions_section(
 }
 
 /// Render the graph centrality highlights section.
-fn render_centrality_section(
-    rs_files: &[PathBuf],
-    project_path_canon: &Path,
-    verbose: bool,
-) {
+fn render_centrality_section(rs_files: &[PathBuf], project_path_canon: &Path, verbose: bool) {
     render::section_header("Graph Centrality");
 
     if verbose {
@@ -386,11 +386,7 @@ fn render_centrality_section(
 }
 
 /// Render the datapath coverage section.
-fn render_datapath_section(
-    rs_files: &[PathBuf],
-    project_path_canon: &Path,
-    verbose: bool,
-) {
+fn render_datapath_section(rs_files: &[PathBuf], project_path_canon: &Path, verbose: bool) {
     render::section_header("Datapath Coverage");
 
     if verbose {
@@ -409,11 +405,7 @@ fn render_datapath_section(
 }
 
 /// Render the circuits overview section.
-fn render_circuits_section(
-    rs_files: &[PathBuf],
-    project_path_canon: &Path,
-    verbose: bool,
-) {
+fn render_circuits_section(rs_files: &[PathBuf], project_path_canon: &Path, verbose: bool) {
     render::section_header("Circuits");
 
     if verbose {
@@ -459,11 +451,19 @@ fn render_stats_footer(
     println!("  ┌{}┐", "─".repeat(box_w));
 
     if let Some(agg) = agg_loc {
-        print_stat("LoC mean / std", &format!("{:.1} / {:.1}", agg.mean, agg.std_dev), box_w);
+        print_stat(
+            "LoC mean / std",
+            &format!("{:.1} / {:.1}", agg.mean, agg.std_dev),
+            box_w,
+        );
         print_stat("LoC median", &format!("{}", agg.median), box_w);
     }
     if let Some(cs) = complexity_stats {
-        print_stat("Complexity mean / std", &format!("{:.1} / {:.1}", cs.mean, cs.std_dev), box_w);
+        print_stat(
+            "Complexity mean / std",
+            &format!("{:.1} / {:.1}", cs.mean, cs.std_dev),
+            box_w,
+        );
         print_stat("Complexity median", &format!("{:.1}", cs.median), box_w);
     }
     print_stat("Total files", &format!("{}", total_files), box_w);
@@ -575,13 +575,25 @@ pub fn render_summary_json(rs_files: &[PathBuf], project_path: &Path) {
     });
 
     let mut by_fan_in: Vec<(&String, usize)> = dep_analysis
-        .in_degree.iter().map(|(m, d)| (m, *d)).filter(|(_, d)| *d > 0).collect();
+        .in_degree
+        .iter()
+        .map(|(m, d)| (m, *d))
+        .filter(|(_, d)| *d > 0)
+        .collect();
     by_fan_in.sort_by(|a, b| b.1.cmp(&a.1));
     let mut by_fan_out: Vec<(&String, usize)> = dep_analysis
-        .out_degree.iter().map(|(m, d)| (m, *d)).filter(|(_, d)| *d > 0).collect();
+        .out_degree
+        .iter()
+        .map(|(m, d)| (m, *d))
+        .filter(|(_, d)| *d > 0)
+        .collect();
     by_fan_out.sort_by(|a, b| b.1.cmp(&a.1));
 
-    let bidi_count = dep_analysis.coupling_pairs.iter().filter(|(_, _, s)| *s >= 2).count();
+    let bidi_count = dep_analysis
+        .coupling_pairs
+        .iter()
+        .filter(|(_, _, s)| *s >= 2)
+        .count();
 
     let deps_json = SummaryDepsJson {
         total_modules: dep_analysis.modules.len(),
@@ -591,24 +603,27 @@ pub fn render_summary_json(rs_files: &[PathBuf], project_path: &Path) {
         highest_fan_out: by_fan_out.first().map(|(n, d)| ((*n).clone(), *d)),
     };
 
-    let graph_json = graph::graph_summary(rs_files, &project_path_canon).map(|gs| SummaryGraphJson {
-        top_bridge: gs.top_bridge,
-        top_hub: gs.top_hub,
-        top_clustered: gs.top_clustered,
-    });
+    let graph_json =
+        graph::graph_summary(rs_files, &project_path_canon).map(|gs| SummaryGraphJson {
+            top_bridge: gs.top_bridge,
+            top_hub: gs.top_hub,
+            top_clustered: gs.top_clustered,
+        });
 
-    let datapaths_json = datapaths::datapath_summary(rs_files, &project_path_canon).map(|ds| SummaryDatapathJson {
-        coverage_pct: ds.coverage_pct,
-        total_functions: ds.total_functions,
-        reachable_count: ds.reachable_count,
-        cold_count: ds.cold_count,
-    });
+    let datapaths_json =
+        datapaths::datapath_summary(rs_files, &project_path_canon).map(|ds| SummaryDatapathJson {
+            coverage_pct: ds.coverage_pct,
+            total_functions: ds.total_functions,
+            reachable_count: ds.reachable_count,
+            cold_count: ds.cold_count,
+        });
 
-    let circuits_json = circuits::circuit_summary(rs_files, &project_path_canon).map(|cs| SummaryCircuitsJson {
-        circuit_count: cs.circuit_count,
-        sizes: cs.sizes,
-        modularity: cs.modularity,
-    });
+    let circuits_json =
+        circuits::circuit_summary(rs_files, &project_path_canon).map(|cs| SummaryCircuitsJson {
+            circuit_count: cs.circuit_count,
+            sizes: cs.sizes,
+            modularity: cs.modularity,
+        });
 
     let output = SummaryJson {
         cstat_version: env!("CARGO_PKG_VERSION").to_string(),

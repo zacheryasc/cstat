@@ -82,8 +82,7 @@ fn extract_signatures(rs_files: &[PathBuf], project_path: &Path) -> Vec<Function
                     let type_name = type_to_short(&imp.self_ty);
                     for impl_item in &imp.items {
                         if let ImplItem::Fn(method) = impl_item {
-                            let qualified =
-                                format!("{}::{}", type_name, method.sig.ident);
+                            let qualified = format!("{}::{}", type_name, method.sig.ident);
                             let sig = extract_fn_sig(&method.sig, &qualified, &rel_path);
                             sigs.push(sig);
                         }
@@ -308,7 +307,7 @@ enum NormNode {
     Loop,
     Let,
     Return,
-    Call(usize),  // number of arguments
+    Call(usize), // number of arguments
     MethodCall(usize),
     Binary,
     Unary,
@@ -335,9 +334,7 @@ fn structural_hash_from_file(
     for item in &ast.items {
         match item {
             Item::Fn(func) => {
-                if func.sig.ident == func_name
-                    || func_name == func.sig.ident.to_string()
-                {
+                if func.sig.ident == func_name || func_name == func.sig.ident.to_string() {
                     return Some(hash_block(&func.block));
                 }
             }
@@ -362,9 +359,7 @@ fn structural_hash_from_file(
 /// Hash a block by normalizing its structure.
 fn hash_block(block: &syn::Block) -> u64 {
     let mut nodes = Vec::new();
-    let mut visitor = StructuralVisitor {
-        nodes: &mut nodes,
-    };
+    let mut visitor = StructuralVisitor { nodes: &mut nodes };
     visitor.visit_block(block);
 
     let mut hasher = DefaultHasher::new();

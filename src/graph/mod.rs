@@ -5,14 +5,13 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use algorithms::{
-    DiGraph, GraphStats,
-    betweenness_centrality, clustering_coefficient,
-    graph_level_stats, pagerank, tarjan_scc,
-};
 use crate::deps;
 use crate::flow;
 use crate::render;
+use algorithms::{
+    betweenness_centrality, clustering_coefficient, graph_level_stats, pagerank, tarjan_scc,
+    DiGraph, GraphStats,
+};
 
 // ── Full analysis result ───────────────────────────────────────────
 
@@ -75,7 +74,11 @@ fn digraph_from_call_graph(cg: &flow::CallGraph) -> DiGraph {
 
 fn digraph_from_dep_analysis(da: &deps::DepAnalysis) -> DiGraph {
     let nodes = da.modules.clone();
-    let edges: Vec<(String, String)> = da.edges.iter().map(|e| (e.from.clone(), e.to.clone())).collect();
+    let edges: Vec<(String, String)> = da
+        .edges
+        .iter()
+        .map(|e| (e.from.clone(), e.to.clone()))
+        .collect();
     DiGraph::from_edges(nodes, &edges)
 }
 
@@ -151,10 +154,7 @@ fn render_stats_box(analysis: &GraphAnalysis, verbose: bool) {
 fn render_sccs(analysis: &GraphAnalysis, verbose: bool) {
     let cyclic_sccs: Vec<&Vec<String>> = analysis.sccs.iter().filter(|c| c.len() > 1).collect();
 
-    println!(
-        "\n  {}",
-        "Strongly Connected Components".bold().underline()
-    );
+    println!("\n  {}", "Strongly Connected Components".bold().underline());
 
     if verbose {
         render::verbose_block(&[
@@ -196,10 +196,7 @@ fn render_metric_section(
     verbose: bool,
     verbose_lines: &[&str],
 ) {
-    println!(
-        "\n  {}",
-        label.bold().underline()
-    );
+    println!("\n  {}", label.bold().underline());
 
     if verbose {
         render::verbose_block(verbose_lines);
@@ -211,7 +208,11 @@ fn render_metric_section(
         return;
     }
 
-    let max_val = sorted_items.first().map(|(_, v)| *v).unwrap_or(1.0).max(f64::MIN_POSITIVE);
+    let max_val = sorted_items
+        .first()
+        .map(|(_, v)| *v)
+        .unwrap_or(1.0)
+        .max(f64::MIN_POSITIVE);
 
     for (name, val) in sorted_items.iter().take(top_n) {
         if *val < f64::EPSILON {
@@ -221,12 +222,7 @@ fn render_metric_section(
         let bar = "█".repeat(bar_len.max(1));
         let ratio = (*val / max_val).min(1.0);
         let colored_bar = render::bar_color(&bar, 1.0 - ratio);
-        println!(
-            "    {:<40} {} {:.4}",
-            name.dimmed(),
-            colored_bar,
-            val,
-        );
+        println!("    {:<40} {} {:.4}", name.dimmed(), colored_bar, val,);
     }
 }
 
@@ -336,20 +332,32 @@ pub fn graph_summary(rs_files: &[PathBuf], project_path: &Path) -> Option<GraphS
         .node_metrics
         .iter()
         .filter(|(_, m)| m.betweenness > f64::EPSILON)
-        .max_by(|a, b| a.1.betweenness.partial_cmp(&b.1.betweenness).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.1.betweenness
+                .partial_cmp(&b.1.betweenness)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|(n, m)| (n.clone(), m.betweenness));
 
     let top_hub = analysis
         .node_metrics
         .iter()
-        .max_by(|a, b| a.1.pagerank.partial_cmp(&b.1.pagerank).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.1.pagerank
+                .partial_cmp(&b.1.pagerank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|(n, m)| (n.clone(), m.pagerank));
 
     let top_clustered = analysis
         .node_metrics
         .iter()
         .filter(|(_, m)| m.clustering > f64::EPSILON)
-        .max_by(|a, b| a.1.clustering.partial_cmp(&b.1.clustering).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.1.clustering
+                .partial_cmp(&b.1.clustering)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|(n, m)| (n.clone(), m.clustering));
 
     Some(GraphSummary {
@@ -381,7 +389,10 @@ pub fn render_graph(
     if !call_only {
         let da = deps::analyze_deps(rs_files, project_path);
         if da.modules.is_empty() {
-            println!("{}", "No modules found for dependency graph analysis.".yellow());
+            println!(
+                "{}",
+                "No modules found for dependency graph analysis.".yellow()
+            );
         } else {
             let dg = digraph_from_dep_analysis(&da);
             let analysis = analyze_graph(&dg, "Module Dependency Graph Analysis");
@@ -436,7 +447,11 @@ fn analysis_to_json(analysis: &GraphAnalysis) -> GraphAnalysisJson {
             clustering: m.clustering,
         })
         .collect();
-    node_metrics.sort_by(|a, b| b.betweenness.partial_cmp(&a.betweenness).unwrap_or(std::cmp::Ordering::Equal));
+    node_metrics.sort_by(|a, b| {
+        b.betweenness
+            .partial_cmp(&a.betweenness)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     GraphAnalysisJson {
         label: analysis.label.clone(),

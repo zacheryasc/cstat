@@ -83,14 +83,38 @@ pub(crate) struct Threshold {
     pub(crate) alert: f64,
 }
 
-pub(crate) const FILE_LOC: Threshold = Threshold { warn: 500.0, alert: 800.0 };
-const FUNC_LOC: Threshold = Threshold { warn: 50.0, alert: 100.0 };
-pub(crate) const CYCLOMATIC: Threshold = Threshold { warn: 10.0, alert: 20.0 };
-pub(crate) const COGNITIVE: Threshold = Threshold { warn: 15.0, alert: 30.0 };
-const NESTING: Threshold = Threshold { warn: 4.0, alert: 6.0 };
-const PARAMS: Threshold = Threshold { warn: 5.0, alert: 8.0 };
-pub(crate) const REDUNDANCY: Threshold = Threshold { warn: 0.7, alert: 0.9 };
-pub(crate) const COHESION: Threshold = Threshold { warn: 0.3, alert: 0.1 };
+pub(crate) const FILE_LOC: Threshold = Threshold {
+    warn: 500.0,
+    alert: 800.0,
+};
+const FUNC_LOC: Threshold = Threshold {
+    warn: 50.0,
+    alert: 100.0,
+};
+pub(crate) const CYCLOMATIC: Threshold = Threshold {
+    warn: 10.0,
+    alert: 20.0,
+};
+pub(crate) const COGNITIVE: Threshold = Threshold {
+    warn: 15.0,
+    alert: 30.0,
+};
+const NESTING: Threshold = Threshold {
+    warn: 4.0,
+    alert: 6.0,
+};
+const PARAMS: Threshold = Threshold {
+    warn: 5.0,
+    alert: 8.0,
+};
+pub(crate) const REDUNDANCY: Threshold = Threshold {
+    warn: 0.7,
+    alert: 0.9,
+};
+pub(crate) const COHESION: Threshold = Threshold {
+    warn: 0.3,
+    alert: 0.1,
+};
 
 // ── Main analysis entry point (orchestrator) ─────────────────────
 
@@ -105,8 +129,7 @@ pub fn run_diagnostics(rs_files: &[PathBuf], project_path: &Path) -> DiagnosticR
     let func_complexities = complexity::compute_all(&symbols, project_path);
 
     // Build per-file function index for cross-referencing
-    let mut funcs_by_file: HashMap<String, Vec<&complexity::FunctionComplexity>> =
-        HashMap::new();
+    let mut funcs_by_file: HashMap<String, Vec<&complexity::FunctionComplexity>> = HashMap::new();
     for fc in &func_complexities {
         funcs_by_file.entry(fc.file.clone()).or_default().push(fc);
     }
@@ -137,13 +160,11 @@ pub fn run_diagnostics(rs_files: &[PathBuf], project_path: &Path) -> DiagnosticR
 
     // --- Sort diagnostics: alerts first, then by metric magnitude descending ---
     diagnostics.sort_by(|a, b| {
-        a.severity
-            .cmp(&b.severity)
-            .then_with(|| {
-                b.metric
-                    .partial_cmp(&a.metric)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+        a.severity.cmp(&b.severity).then_with(|| {
+            b.metric
+                .partial_cmp(&a.metric)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
 
     // --- Compute health scores ---
@@ -195,14 +216,22 @@ fn diagnose_bloated_files(
             let top_complex: Vec<serde_json::Value> = file_funcs
                 .map(|fns| {
                     let mut sorted: Vec<_> = fns.iter().collect();
-                    sorted.sort_by(|a, b| b.composite_score.partial_cmp(&a.composite_score).unwrap_or(std::cmp::Ordering::Equal));
-                    sorted.into_iter().take(3).map(|f| {
-                        serde_json::json!({
-                            "name": f.name,
-                            "composite_score": f.composite_score,
-                            "lines": f.line_count
+                    sorted.sort_by(|a, b| {
+                        b.composite_score
+                            .partial_cmp(&a.composite_score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    sorted
+                        .into_iter()
+                        .take(3)
+                        .map(|f| {
+                            serde_json::json!({
+                                "name": f.name,
+                                "composite_score": f.composite_score,
+                                "lines": f.line_count
+                            })
                         })
-                    }).collect()
+                        .collect()
                 })
                 .unwrap_or_default();
 
@@ -211,7 +240,10 @@ fn diagnose_bloated_files(
                 "top_complex_functions": top_complex,
             });
 
-            let msg = format!("{} is {} lines with {} functions", rel_path, stat.code_lines, func_count);
+            let msg = format!(
+                "{} is {} lines with {} functions",
+                rel_path, stat.code_lines, func_count
+            );
 
             diagnostics.push(Diagnostic {
                 severity,
@@ -242,10 +274,7 @@ fn diagnose_function_metrics(
     }
 }
 
-fn diagnose_fn_complexity(
-    fc: &complexity::FunctionComplexity,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+fn diagnose_fn_complexity(fc: &complexity::FunctionComplexity, diagnostics: &mut Vec<Diagnostic>) {
     let line_count = fc.line_count as f64;
     let cyc = fc.cyclomatic as f64;
     let cog = fc.cognitive as f64;
@@ -318,10 +347,7 @@ fn diagnose_fn_complexity(
     }
 }
 
-fn diagnose_fn_structure(
-    fc: &complexity::FunctionComplexity,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+fn diagnose_fn_structure(fc: &complexity::FunctionComplexity, diagnostics: &mut Vec<Diagnostic>) {
     let nest = fc.nesting_depth as f64;
     let params = fc.param_count as f64;
 
@@ -369,10 +395,7 @@ fn diagnose_fn_structure(
     }
 }
 
-fn diagnose_coupling(
-    dep_analysis: &deps::DepAnalysis,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+fn diagnose_coupling(dep_analysis: &deps::DepAnalysis, diagnostics: &mut Vec<Diagnostic>) {
     for (a, b, strength) in &dep_analysis.coupling_pairs {
         if *strength >= 2 {
             let fan_in_a = dep_analysis.in_degree.get(a).copied().unwrap_or(0);
@@ -405,10 +428,7 @@ fn diagnose_coupling(
     }
 }
 
-fn diagnose_god_modules(
-    dep_analysis: &deps::DepAnalysis,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+fn diagnose_god_modules(dep_analysis: &deps::DepAnalysis, diagnostics: &mut Vec<Diagnostic>) {
     let fan_totals: Vec<f64> = dep_analysis
         .modules
         .iter()
@@ -424,7 +444,10 @@ fn diagnose_god_modules(
     }
 
     let mean_fan = fan_totals.iter().sum::<f64>() / fan_totals.len() as f64;
-    let var_fan = fan_totals.iter().map(|v| (v - mean_fan).powi(2)).sum::<f64>()
+    let var_fan = fan_totals
+        .iter()
+        .map(|v| (v - mean_fan).powi(2))
+        .sum::<f64>()
         / fan_totals.len() as f64;
     let std_fan = var_fan.sqrt();
     let warn_thresh = mean_fan + std_fan;
@@ -515,25 +538,21 @@ fn diagnose_dead_code(
                 metric: 0.0,
                 threshold: 0.0,
                 context: None,
-                message: format!(
-                    "{} is not reachable from any entry point",
-                    func
-                ),
+                message: format!("{} is not reachable from any entry point", func),
             });
         }
     }
 }
 
-fn diagnose_cyclic_deps(
-    dep_analysis: &deps::DepAnalysis,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+fn diagnose_cyclic_deps(dep_analysis: &deps::DepAnalysis, diagnostics: &mut Vec<Diagnostic>) {
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     for m in &dep_analysis.modules {
         adj.entry(m.clone()).or_default();
     }
     for edge in &dep_analysis.edges {
-        adj.entry(edge.from.clone()).or_default().push(edge.to.clone());
+        adj.entry(edge.from.clone())
+            .or_default()
+            .push(edge.to.clone());
     }
 
     let sccs = scoring::tarjan_scc_simple(&dep_analysis.modules, &adj);
@@ -557,11 +576,7 @@ fn diagnose_cyclic_deps(
                 metric: scc.len() as f64,
                 threshold: 1.0,
                 context: Some(ctx),
-                message: format!(
-                    "Cyclic dependency among {} modules: {}",
-                    scc.len(),
-                    members
-                ),
+                message: format!("Cyclic dependency among {} modules: {}", scc.len(), members),
             });
         }
     }
@@ -590,7 +605,10 @@ fn diagnose_redundancy(
             });
             let msg = format!(
                 "{} and {} have {:.0}% similarity ({})",
-                pair.func_a, pair.func_b, pair.similarity * 100.0, pair.kind
+                pair.func_a,
+                pair.func_b,
+                pair.similarity * 100.0,
+                pair.kind
             );
             diagnostics.push(Diagnostic {
                 severity,

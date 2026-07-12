@@ -110,12 +110,21 @@ fn build_diagnostic_counts(diagnostics: &[diagnostics::Diagnostic]) -> Diagnosti
         "cyclic_deps",
     ];
     for cat in &all_categories {
-        by_category.insert(cat.to_string(), CategoryCounts { alerts: 0, warns: 0 });
+        by_category.insert(
+            cat.to_string(),
+            CategoryCounts {
+                alerts: 0,
+                warns: 0,
+            },
+        );
     }
 
     for d in diagnostics {
         let cat_name = category_name(&d.category);
-        let entry = by_category.entry(cat_name).or_insert(CategoryCounts { alerts: 0, warns: 0 });
+        let entry = by_category.entry(cat_name).or_insert(CategoryCounts {
+            alerts: 0,
+            warns: 0,
+        });
         match d.severity {
             diagnostics::Severity::Alert => {
                 total_alerts += 1;
@@ -170,11 +179,23 @@ fn build_drilldowns(diagnostics: &[diagnostics::Diagnostic]) -> Vec<Drilldown> {
 
     // Map categories to subcommands
     let category_to_command: &[(&[&str], &str)] = &[
-        (&["bloated_function", "high_complexity", "high_cognitive", "deep_nesting", "too_many_params"], "cstat complexity --json"),
+        (
+            &[
+                "bloated_function",
+                "high_complexity",
+                "high_cognitive",
+                "deep_nesting",
+                "too_many_params",
+            ],
+            "cstat complexity --json",
+        ),
         (&["redundant_code"], "cstat redundancy --json"),
         (&["bloated_file"], "cstat loc --json"),
-        (&["low_cohesion", "high_coupling", "god_module"], "cstat deps --json"),
-        (&["dead_code"], "cstat datapaths --json"),
+        (
+            &["low_cohesion", "high_coupling", "god_module"],
+            "cstat deps --json",
+        ),
+        (&["dead_code"], "cstat test-reachability --json"),
         (&["cyclic_deps"], "cstat graph --json"),
     ];
 

@@ -135,6 +135,7 @@ fn parse_file(path: &Path) -> FileSymbols {
         enums: vec![],
         traits: vec![],
         impls: vec![],
+        module_parts: vec![],
     };
 
     for item in &ast.items {
@@ -159,18 +160,16 @@ struct SymbolExtractor {
     enums: Vec<EnumInfo>,
     traits: Vec<TraitInfo>,
     impls: Vec<ImplInfo>,
+    module_parts: Vec<String>,
 }
 
 impl SymbolExtractor {
     fn extract_item(&mut self, item: &Item) {
         match item {
             Item::Fn(func) => {
-                let info = extract_function_info(
-                    &func.sig.ident.to_string(),
-                    &self.file_path,
-                    &func.sig,
-                    Some(&func.block),
-                );
+                let name = self.qualify_name(&func.sig.ident.to_string());
+                let info =
+                    extract_function_info(&name, &self.file_path, &func.sig, Some(&func.block));
                 self.functions.push(info);
             }
             Item::Struct(s) => {
@@ -182,7 +181,7 @@ impl SymbolExtractor {
                 let derive_count = count_derives(&s.attrs);
                 let generic_param_count = s.generics.params.len();
                 self.structs.push(StructInfo {
-                    name: s.ident.to_string(),
+                    name: self.qualify_name(&s.ident.to_string()),
                     file: self.file_path.clone(),
                     field_count,
                     derive_count,
@@ -193,7 +192,7 @@ impl SymbolExtractor {
                 let derive_count = count_derives(&e.attrs);
                 let generic_param_count = e.generics.params.len();
                 self.enums.push(EnumInfo {
-                    name: e.ident.to_string(),
+                    name: self.qualify_name(&e.ident.to_string()),
                     file: self.file_path.clone(),
                     variant_count: e.variants.len(),
                     derive_count,
@@ -208,14 +207,14 @@ impl SymbolExtractor {
                     .count();
                 let generic_param_count = t.generics.params.len();
                 self.traits.push(TraitInfo {
-                    name: t.ident.to_string(),
+                    name: self.qualify_name(&t.ident.to_string()),
                     file: self.file_path.clone(),
                     method_count,
                     generic_param_count,
                 });
             }
             Item::Impl(imp) => {
-                let target_type = type_to_string(&imp.self_ty);
+                let target_type = self.qualify_name(&type_to_string(&imp.self_ty));
                 let trait_name = imp.trait_.as_ref().map(|(_, path, _)| {
                     path.segments
                         .iter()
@@ -244,7 +243,24 @@ impl SymbolExtractor {
                     trait_name,
                 });
             }
+            Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    self.module_parts.push(module.ident.to_string());
+                    for item in items {
+                        self.extract_item(item);
+                    }
+                    self.module_parts.pop();
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn qualify_name(&self, name: &str) -> String {
+        if self.module_parts.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{}", self.module_parts.join("::"), name)
         }
     }
 }
@@ -303,10 +319,7 @@ fn extract_function_info(
 
 /// Count derives from attributes.
 fn count_derives(attrs: &[syn::Attribute]) -> usize {
-    attrs
-        .iter()
-        .filter(|a| a.path().is_ident("derive"))
-        .count()
+    attrs.iter().filter(|a| a.path().is_ident("derive")).count()
 }
 
 /// Count trait bounds across all generic parameters.

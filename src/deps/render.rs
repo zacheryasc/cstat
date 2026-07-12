@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::render;
 
-use super::{DepAnalysis, ModuleCohesion, analyze_deps, compute_cohesion};
+use super::{analyze_deps, compute_cohesion, DepAnalysis, ModuleCohesion};
 
 #[derive(Serialize)]
 struct DepEdgeJson {
@@ -178,13 +178,7 @@ fn render_dependency_matrix(analysis: &DepAnalysis, top_n: usize, term_w: usize,
         .map(|e| (e.from.as_str(), e.to.as_str()))
         .collect();
 
-    let max_label = 20.min(
-        display_modules
-            .iter()
-            .map(|m| m.len())
-            .max()
-            .unwrap_or(5),
-    );
+    let max_label = 20.min(display_modules.iter().map(|m| m.len()).max().unwrap_or(5));
 
     let matrix_start = max_label + 3;
     let available = term_w.saturating_sub(matrix_start);
@@ -248,7 +242,12 @@ fn render_coupling_ranking(analysis: &DepAnalysis, top_n: usize, verbose: bool) 
             b.clone()
         };
 
-        println!("  {:<30} {:<30} {}", a_display.dimmed(), b_display.dimmed(), coupling_label);
+        println!(
+            "  {:<30} {:<30} {}",
+            a_display.dimmed(),
+            b_display.dimmed(),
+            coupling_label
+        );
     }
 
     if analysis.coupling_pairs.len() > display_count {
@@ -413,17 +412,26 @@ fn render_cohesion_section(cohesion: &[ModuleCohesion], top_n: usize, verbose: b
         ]);
     }
 
-    let display: Vec<&ModuleCohesion> = cohesion.iter()
+    let display: Vec<&ModuleCohesion> = cohesion
+        .iter()
         .filter(|c| c.function_count > 1)
         .take(top_n)
         .collect();
 
     if display.is_empty() {
-        println!("  {}", "No multi-function modules to measure cohesion.".dimmed());
+        println!(
+            "  {}",
+            "No multi-function modules to measure cohesion.".dimmed()
+        );
         return;
     }
 
-    let max_label_len = display.iter().map(|c| c.module.len()).max().unwrap_or(5).min(25);
+    let max_label_len = display
+        .iter()
+        .map(|c| c.module.len())
+        .max()
+        .unwrap_or(5)
+        .min(25);
 
     println!(
         "\n  {:>width$}   {:<8} {:<8} {}",
@@ -481,7 +489,10 @@ pub fn render_deps_json(rs_files: &[PathBuf], project_path: &Path) {
     let edges: Vec<DepEdgeJson> = analysis
         .edges
         .iter()
-        .map(|e| DepEdgeJson { from: e.from.clone(), to: e.to.clone() })
+        .map(|e| DepEdgeJson {
+            from: e.from.clone(),
+            to: e.to.clone(),
+        })
         .collect();
 
     let module_degrees: Vec<ModuleDegreeJson> = analysis
@@ -501,7 +512,11 @@ pub fn render_deps_json(rs_files: &[PathBuf], project_path: &Path) {
             module_a: a.clone(),
             module_b: b.clone(),
             strength: *s,
-            direction: if *s >= 2 { "bidirectional".to_string() } else { "unidirectional".to_string() },
+            direction: if *s >= 2 {
+                "bidirectional".to_string()
+            } else {
+                "unidirectional".to_string()
+            },
         })
         .collect();
 

@@ -6,8 +6,8 @@ use walkdir::WalkDir;
 /// Given a project root directory, this function:
 /// 1. Verifies a `Cargo.toml` exists at the root.
 /// 2. Checks for a `[workspace]` section to find workspace members.
-/// 3. Walks `src/` directories of the root crate and any workspace members.
-/// 4. Collects all `.rs` files found.
+/// 3. Walks `src/`, `tests/`, and `benches/` directories of the root crate
+///    and any workspace members.
 pub fn discover_rs_files(project_path: &Path) -> Result<Vec<PathBuf>, String> {
     let project_path = project_path
         .canonicalize()
@@ -29,13 +29,10 @@ pub fn discover_rs_files(project_path: &Path) -> Result<Vec<PathBuf>, String> {
 
     let workspace_members = parse_workspace_members(&cargo_content);
     if workspace_members.is_empty() {
-        // Single crate — walk `src/` from the root
-        let src_dir = project_path.join("src");
-        if src_dir.is_dir() {
-            source_dirs.push(src_dir);
-        }
+        // Single crate — walk Rust source, test, and benchmark roots.
+        push_standard_rust_dirs(&project_path, &mut source_dirs);
     } else {
-        // Workspace — walk each member's `src/`
+        // Workspace — walk each member's Rust source, test, and benchmark roots.
         for member in &workspace_members {
             // Handle glob patterns (e.g., "crates/*")
             let member_path = project_path.join(member);
@@ -46,27 +43,18 @@ pub fn discover_rs_files(project_path: &Path) -> Result<Vec<PathBuf>, String> {
                             if let Ok(entry) = entry {
                                 let p = entry.path();
                                 if p.is_dir() && p.join("Cargo.toml").exists() {
-                                    let src = p.join("src");
-                                    if src.is_dir() {
-                                        source_dirs.push(src);
-                                    }
+                                    push_standard_rust_dirs(&p, &mut source_dirs);
                                 }
                             }
                         }
                     }
                 }
             } else if member_path.is_dir() {
-                let src = member_path.join("src");
-                if src.is_dir() {
-                    source_dirs.push(src);
-                }
+                push_standard_rust_dirs(&member_path, &mut source_dirs);
             }
         }
-        // Also include root src/ if it exists (some workspaces have a root crate)
-        let root_src = project_path.join("src");
-        if root_src.is_dir() {
-            source_dirs.push(root_src);
-        }
+        // Also include root dirs if they exist (some workspaces have a root crate).
+        push_standard_rust_dirs(&project_path, &mut source_dirs);
     }
 
     let mut rs_files: Vec<PathBuf> = Vec::new();
@@ -81,6 +69,15 @@ pub fn discover_rs_files(project_path: &Path) -> Result<Vec<PathBuf>, String> {
 
     rs_files.sort();
     Ok(rs_files)
+}
+
+fn push_standard_rust_dirs(crate_path: &Path, source_dirs: &mut Vec<PathBuf>) {
+    for dirname in ["src", "tests", "benches"] {
+        let dir = crate_path.join(dirname);
+        if dir.is_dir() && !source_dirs.contains(&dir) {
+            source_dirs.push(dir);
+        }
+    }
 }
 
 /// Simple parser for workspace members from Cargo.toml content.

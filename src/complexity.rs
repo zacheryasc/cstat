@@ -496,7 +496,11 @@ fn strip_project_path(path: &str, project_path: &Path) -> String {
 }
 
 /// Render the function complexity rankings table.
-fn render_function_rankings(func_complexities: &[FunctionComplexity], _term_w: usize, verbose: bool) {
+fn render_function_rankings(
+    func_complexities: &[FunctionComplexity],
+    _term_w: usize,
+    verbose: bool,
+) {
     println!(
         "\n{}",
         "\u{2500}\u{2500} Function Complexity Rankings \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
@@ -576,7 +580,11 @@ fn render_function_rankings(func_complexities: &[FunctionComplexity], _term_w: u
 }
 
 /// Render the per-file complexity bar chart.
-fn render_file_complexity_chart(file_complexities: &[FileComplexity], term_w: usize, verbose: bool) {
+fn render_file_complexity_chart(
+    file_complexities: &[FileComplexity],
+    term_w: usize,
+    verbose: bool,
+) {
     println!(
         "\n{}",
         "\u{2500}\u{2500} Per-File Complexity \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
@@ -758,7 +766,6 @@ pub fn render_complexity_json(symbols: &ProjectSymbols, project_path: &Path) {
 
     println!("{}", serde_json::to_string(&output).unwrap());
 }
-
 
 pub fn run(rs_files: &[std::path::PathBuf], project_path: &Path, json: bool, verbose: bool) {
     let symbols = crate::ast_parser::parse_project(rs_files);

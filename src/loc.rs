@@ -113,10 +113,7 @@ fn count_lines(path: &Path) -> Option<FileLocStats> {
 
 /// Count lines for all files and compute aggregate statistics.
 pub fn analyze_files(files: &[PathBuf]) -> (Vec<FileLocStats>, Option<AggregateStats>) {
-    let mut file_stats: Vec<FileLocStats> = files
-        .iter()
-        .filter_map(|f| count_lines(f))
-        .collect();
+    let mut file_stats: Vec<FileLocStats> = files.iter().filter_map(|f| count_lines(f)).collect();
 
     // Sort descending by code lines
     file_stats.sort_by(|a, b| b.code_lines.cmp(&a.code_lines));
@@ -162,7 +159,6 @@ pub fn analyze_files(files: &[PathBuf]) -> (Vec<FileLocStats>, Option<AggregateS
 
     (file_stats, Some(agg))
 }
-
 
 /// Strip the common project prefix from paths for display.
 fn strip_prefix<'a>(path: &'a Path, base: &Path) -> &'a Path {
@@ -218,9 +214,7 @@ fn render_loc_stats_box(agg: &AggregateStats, verbose: bool) {
         ]);
     }
 
-    println!(
-        "┌─────────────┬──────────────┐"
-    );
+    println!("┌─────────────┬──────────────┐");
     render::print_stat_row("Total files", &format!("{}", agg.total_files));
     render::print_stat_row("Total LoC", &format!("{}", agg.total_loc));
     render::print_stat_row("Mean", &format!("{:.1}", agg.mean));
@@ -228,9 +222,7 @@ fn render_loc_stats_box(agg: &AggregateStats, verbose: bool) {
     render::print_stat_row("Median", &format!("{}", agg.median));
     render::print_stat_row("Min", &format!("{}", agg.min));
     render::print_stat_row("Max", &format!("{}", agg.max));
-    println!(
-        "└─────────────┴──────────────┘"
-    );
+    println!("└─────────────┴──────────────┘");
 }
 
 /// Render the full LoC analysis for the `loc` subcommand.
@@ -298,11 +290,7 @@ pub fn render_loc(files: &[PathBuf], project_path: &Path, top_n: Option<usize>, 
     if display_count < file_stats.len() {
         println!(
             "{}",
-            format!(
-                "  ... and {} more files",
-                file_stats.len() - display_count
-            )
-            .dimmed()
+            format!("  ... and {} more files", file_stats.len() - display_count).dimmed()
         );
     }
 
@@ -312,7 +300,6 @@ pub fn render_loc(files: &[PathBuf], project_path: &Path, top_n: Option<usize>, 
     // Treemap visualization
     render_treemap(&file_stats, project_path, verbose);
 }
-
 
 /// Render LoC analysis as JSON.
 pub fn render_loc_json(files: &[PathBuf], project_path: &Path) {
@@ -353,7 +340,10 @@ pub fn render_loc_json(files: &[PathBuf], project_path: &Path) {
     dirs.sort_by(|a, b| b.1.cmp(&a.1));
     let directory_breakdown: Vec<DirBreakdownJson> = dirs
         .into_iter()
-        .map(|(directory, code_lines)| DirBreakdownJson { directory, code_lines })
+        .map(|(directory, code_lines)| DirBreakdownJson {
+            directory,
+            code_lines,
+        })
         .collect();
 
     let output = LocJson {
@@ -423,7 +413,10 @@ fn insert_into_tree(node: &mut TreeNode, parts: &[String], loc: usize) {
     }
     // Find or create directory child
     let dir_name = &parts[0];
-    let pos = node.children.iter().position(|c| !c.is_leaf() && c.name == *dir_name);
+    let pos = node
+        .children
+        .iter()
+        .position(|c| !c.is_leaf() && c.name == *dir_name);
     if let Some(idx) = pos {
         insert_into_tree(&mut node.children[idx], &parts[1..], loc);
     } else {
@@ -543,7 +536,12 @@ fn render_box_lines(node: &TreeNode, width: usize, total_loc: usize) -> Vec<Stri
             let colored_name = treemap_color(&file_text, child_ratio);
             let colored_loc = treemap_color(&loc_text, child_ratio);
 
-            lines.push(format!("│{}{}{}│", colored_name, dots.dimmed(), colored_loc));
+            lines.push(format!(
+                "│{}{}{}│",
+                colored_name,
+                dots.dimmed(),
+                colored_loc
+            ));
         } else {
             // Render sub-directory as a nested box, then wrap each line in our │ borders
             let child_lines = render_box_lines(child, inner_w, total_loc);
@@ -559,4 +557,3 @@ fn render_box_lines(node: &TreeNode, width: usize, total_loc: usize) -> Vec<Stri
     lines.push(format!("└{}┘", "─".repeat(width.saturating_sub(2))));
     lines
 }
-

@@ -4,13 +4,25 @@ use serde::Serialize;
 // ── Topic definitions ──────────────────────────────────────────────
 
 pub const TOPICS: &[(&str, &str)] = &[
-    ("getting-started", "First steps: reading your codebase with cstat"),
+    (
+        "getting-started",
+        "First steps: reading your codebase with cstat",
+    ),
     ("size", "File and function size, LoC distribution"),
-    ("complexity", "Cyclomatic, cognitive, nesting, parameter metrics"),
-    ("modularity", "Coupling, cohesion, dependency structure, circuits"),
+    (
+        "complexity",
+        "Cyclomatic, cognitive, nesting, parameter metrics",
+    ),
+    (
+        "modularity",
+        "Coupling, cohesion, dependency structure, circuits",
+    ),
     ("flow", "Call graph, reachability, dead code, hot paths"),
     ("redundancy", "Similar and duplicate function detection"),
-    ("architecture", "Centrality, SCCs, hubs, tiers, graph topology"),
+    (
+        "architecture",
+        "Centrality, SCCs, hubs, tiers, graph topology",
+    ),
 ];
 
 struct TopicContent {
@@ -162,10 +174,12 @@ be called, not runtime frequency.",
             ("hot paths", "Paths through the call graph that visit the most functions. Shows the main execution spine."),
         ],
         commands: &[
-            "cstat flow              — call graph edges, entry points, cycles, cold functions",
-            "cstat flow --json       — structured call graph data",
-            "cstat datapaths         — random walk heatmaps showing execution flow patterns",
-            "cstat datapaths --json  — structured visit counts and hot paths",
+            "cstat flow                     — call graph edges, entry points, cycles, cold functions",
+            "cstat flow --json              — structured call graph data",
+            "cstat test-reachability        — static test/benchmark reachability",
+            "cstat test-reachability --json — structured test/benchmark reachability data",
+            "cstat advanced flow-heatmap       — legacy random-walk heatmap",
+            "cstat advanced flow-heatmap --json — structured visit counts and hot paths",
         ],
         patterns: &[
             "Cold functions that are not pub items or test helpers are likely dead code. \
@@ -308,7 +322,10 @@ pub fn render_guide_topic(topic: &str, json: bool) {
 
 fn render_guide_toc_human() {
     println!();
-    println!("{}", "cstat guide — code health reference".bright_cyan().bold());
+    println!(
+        "{}",
+        "cstat guide — code health reference".bright_cyan().bold()
+    );
     println!();
     for (name, summary) in TOPICS {
         println!("  {:<18}{}", name.bold(), summary);

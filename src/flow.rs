@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
-use syn::{File as SynFile, Item, ImplItem};
+use syn::{File as SynFile, ImplItem, Item};
 
 use crate::render;
 
@@ -14,14 +14,35 @@ pub struct CallEdge {
     pub callee: String,
 }
 
+/// Kind of root used when tracing call paths.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryPointKind {
+    Main,
+    Test,
+    Bench,
+}
+
+impl EntryPointKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EntryPointKind::Main => "main",
+            EntryPointKind::Test => "test",
+            EntryPointKind::Bench => "bench",
+        }
+    }
+}
+
 /// Result of call graph analysis.
 pub struct CallGraph {
     /// All known function names (qualified: Module::method or bare function).
     pub functions: Vec<String>,
     /// Edges: caller -> list of callees.
     pub adjacency: HashMap<String, Vec<String>>,
-    /// Entry points (main, #[test] functions).
+    /// Entry points (main, tests, and benchmarks).
     pub entry_points: Vec<String>,
+    /// Entry point classification keyed by function name.
+    pub entry_point_kinds: HashMap<String, EntryPointKind>,
     /// Edges that form cycles.
     pub cycle_edges: HashSet<(String, String)>,
 }
@@ -61,7 +82,12 @@ impl<'ast> Visit<'ast> for CallSiteExtractor {
 fn expr_to_callee_name(expr: &syn::Expr) -> Option<String> {
     match expr {
         syn::Expr::Path(ep) => {
-            let segments: Vec<String> = ep.path.segments.iter().map(|s| s.ident.to_string()).collect();
+            let segments: Vec<String> = ep
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
             Some(segments.join("::"))
         }
         _ => None,
@@ -72,8 +98,8 @@ fn expr_to_callee_name(expr: &syn::Expr) -> Option<String> {
 fn extract_calls_from_file(
     path: &Path,
     project_path: &Path,
-) -> (Vec<(String, bool)>, Vec<CallEdge>) {
-    // Returns: (list of (fn_name, is_entry_point), list of call edges)
+) -> (Vec<(String, Option<EntryPointKind>)>, Vec<CallEdge>) {
+    // Returns: (list of (fn_name, entry kind), list of call edges)
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return (vec![], vec![]),
@@ -85,21 +111,41 @@ fn extract_calls_from_file(
     };
 
     let module = render::module_name_from_path(path, project_path);
-    let mut functions: Vec<(String, bool)> = Vec::new();
+    let base_modules: Vec<String> = if module == "main" || module == "lib" {
+        Vec::new()
+    } else {
+        module.split("::").map(|s| s.to_string()).collect()
+    };
+    let mut functions: Vec<(String, Option<EntryPointKind>)> = Vec::new();
     let mut all_edges: Vec<CallEdge> = Vec::new();
 
-    for item in &ast.items {
+    extract_items(
+        &ast.items,
+        path,
+        project_path,
+        &base_modules,
+        &mut functions,
+        &mut all_edges,
+    );
+
+    (functions, all_edges)
+}
+
+fn extract_items(
+    items: &[Item],
+    path: &Path,
+    project_path: &Path,
+    module_parts: &[String],
+    functions: &mut Vec<(String, Option<EntryPointKind>)>,
+    all_edges: &mut Vec<CallEdge>,
+) {
+    for item in items {
         match item {
             Item::Fn(func) => {
                 let name = func.sig.ident.to_string();
-                let qualified = if module == "main" || module == "lib" {
-                    name.clone()
-                } else {
-                    format!("{}::{}", module, name)
-                };
-
-                let is_entry = name == "main" || has_test_attr(&func.attrs);
-                functions.push((qualified.clone(), is_entry));
+                let qualified = qualify_name(module_parts, &name);
+                let entry_kind = classify_entry_point(&name, &func.attrs, path, project_path);
+                functions.push((qualified.clone(), entry_kind));
 
                 let mut extractor = CallSiteExtractor {
                     current_fn: qualified,
@@ -109,12 +155,14 @@ fn extract_calls_from_file(
                 all_edges.extend(extractor.edges);
             }
             Item::Impl(imp) => {
-                let type_name = type_to_short_string(&imp.self_ty);
+                let type_name = qualify_name(module_parts, &type_to_short_string(&imp.self_ty));
                 for impl_item in &imp.items {
                     if let ImplItem::Fn(method) = impl_item {
-                        let qualified = format!("{}::{}", type_name, method.sig.ident);
-                        let is_entry = has_test_attr(&method.attrs);
-                        functions.push((qualified.clone(), is_entry));
+                        let method_name = method.sig.ident.to_string();
+                        let qualified = format!("{}::{}", type_name, method_name);
+                        let entry_kind =
+                            classify_entry_point(&method_name, &method.attrs, path, project_path);
+                        functions.push((qualified.clone(), entry_kind));
 
                         let mut extractor = CallSiteExtractor {
                             current_fn: qualified,
@@ -125,16 +173,63 @@ fn extract_calls_from_file(
                     }
                 }
             }
+            Item::Mod(module) => {
+                if let Some((_, nested_items)) = &module.content {
+                    let mut nested_parts = module_parts.to_vec();
+                    nested_parts.push(module.ident.to_string());
+                    extract_items(
+                        nested_items,
+                        path,
+                        project_path,
+                        &nested_parts,
+                        functions,
+                        all_edges,
+                    );
+                }
+            }
             _ => {}
         }
     }
-
-    (functions, all_edges)
 }
 
-/// Check if attributes contain #[test].
-fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| a.path().is_ident("test"))
+fn qualify_name(module_parts: &[String], name: &str) -> String {
+    if module_parts.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}::{}", module_parts.join("::"), name)
+    }
+}
+
+fn classify_entry_point(
+    name: &str,
+    attrs: &[syn::Attribute],
+    path: &Path,
+    project_path: &Path,
+) -> Option<EntryPointKind> {
+    if has_attr_named(attrs, "test") {
+        Some(EntryPointKind::Test)
+    } else if has_attr_named(attrs, "bench") || is_under_dir(path, project_path, "benches") {
+        Some(EntryPointKind::Bench)
+    } else if name == "main" {
+        Some(EntryPointKind::Main)
+    } else {
+        None
+    }
+}
+
+fn has_attr_named(attrs: &[syn::Attribute], wanted: &str) -> bool {
+    attrs.iter().any(|a| {
+        a.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == wanted)
+    })
+}
+
+fn is_under_dir(path: &Path, project_path: &Path, dir_name: &str) -> bool {
+    let rel = path.strip_prefix(project_path).unwrap_or(path);
+    rel.components()
+        .any(|component| component.as_os_str() == dir_name)
 }
 
 /// Convert a Type to a short string.
@@ -152,19 +247,27 @@ fn type_to_short_string(ty: &syn::Type) -> String {
 }
 
 /// Resolve a callee name against known function names.
-/// Tries exact match first, then suffix match (e.g., "foo" matches "module::foo").
-fn resolve_callee(callee: &str, known: &HashMap<String, usize>) -> Option<String> {
-    // Exact match
+/// Tries exact match first, then caller-local sibling match, then suffix match.
+fn resolve_callee(callee: &str, caller: &str, known: &HashMap<String, usize>) -> Option<String> {
     if known.contains_key(callee) {
         return Some(callee.to_string());
     }
-    // Suffix match: callee might be "parse_project" but known has "ast_parser::parse_project"
+
+    if !callee.contains("::") {
+        if let Some((caller_parent, _)) = caller.rsplit_once("::") {
+            let sibling = format!("{caller_parent}::{callee}");
+            if known.contains_key(&sibling) {
+                return Some(sibling);
+            }
+        }
+    }
+
     let suffix = format!("::{}", callee);
     let mut matches: Vec<&String> = known.keys().filter(|k| k.ends_with(&suffix)).collect();
     if matches.len() == 1 {
         return Some(matches[0].clone());
     }
-    // If callee contains ::, also try matching the last two segments
+
     if callee.contains("::") {
         matches = known.keys().filter(|k| k.ends_with(callee)).collect();
         if matches.len() == 1 {
@@ -182,7 +285,13 @@ fn detect_cycles(adjacency: &HashMap<String, Vec<String>>) -> HashSet<(String, S
 
     for node in adjacency.keys() {
         if !visited.contains(node) {
-            dfs_cycle(node, adjacency, &mut visited, &mut on_stack, &mut cycle_edges);
+            dfs_cycle(
+                node,
+                adjacency,
+                &mut visited,
+                &mut on_stack,
+                &mut cycle_edges,
+            );
         }
     }
     cycle_edges
@@ -213,7 +322,7 @@ fn dfs_cycle(
 
 /// Build the call graph from all project files.
 pub fn build_call_graph(rs_files: &[PathBuf], project_path: &Path) -> CallGraph {
-    let mut all_functions: Vec<(String, bool)> = Vec::new();
+    let mut all_functions: Vec<(String, Option<EntryPointKind>)> = Vec::new();
     let mut all_edges: Vec<CallEdge> = Vec::new();
 
     for file in rs_files {
@@ -230,16 +339,20 @@ pub fn build_call_graph(rs_files: &[PathBuf], project_path: &Path) -> CallGraph 
         .collect();
 
     let functions: Vec<String> = all_functions.iter().map(|(n, _)| n.clone()).collect();
+    let entry_point_kinds: HashMap<String, EntryPointKind> = all_functions
+        .iter()
+        .filter_map(|(name, kind)| kind.clone().map(|k| (name.clone(), k)))
+        .collect();
     let entry_points: Vec<String> = all_functions
         .iter()
-        .filter(|(_, is_entry)| *is_entry)
+        .filter(|(name, _)| entry_point_kinds.contains_key(name))
         .map(|(n, _)| n.clone())
         .collect();
 
     // Resolve edges against known functions
     let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
     for edge in &all_edges {
-        if let Some(resolved) = resolve_callee(&edge.callee, &known) {
+        if let Some(resolved) = resolve_callee(&edge.callee, &edge.caller, &known) {
             if resolved != edge.caller {
                 adjacency
                     .entry(edge.caller.clone())
@@ -261,8 +374,38 @@ pub fn build_call_graph(rs_files: &[PathBuf], project_path: &Path) -> CallGraph 
         functions,
         adjacency,
         entry_points,
+        entry_point_kinds,
         cycle_edges,
     }
+}
+
+/// Return every function reachable from the graph's entry points.
+pub fn reachable_from_entries(call_graph: &CallGraph) -> HashSet<String> {
+    let mut reachable = HashSet::new();
+    let mut queue: Vec<String> = call_graph.entry_points.clone();
+    while let Some(node) = queue.pop() {
+        if !reachable.insert(node.clone()) {
+            continue;
+        }
+        if let Some(callees) = call_graph.adjacency.get(&node) {
+            for callee in callees {
+                if !reachable.contains(callee) {
+                    queue.push(callee.clone());
+                }
+            }
+        }
+    }
+    reachable
+}
+
+/// Return entry points matching a specific kind.
+pub fn entry_points_by_kind(call_graph: &CallGraph, kind: EntryPointKind) -> Vec<String> {
+    call_graph
+        .entry_points
+        .iter()
+        .filter(|entry| call_graph.entry_point_kinds.get(*entry) == Some(&kind))
+        .cloned()
+        .collect()
 }
 
 /// Render the call graph as a tree rooted at entry points.
@@ -324,7 +467,9 @@ fn render_subtree(
         let connector = if is_last { "└── " } else { "├── " };
         let child_prefix = if is_last { "    " } else { "│   " };
 
-        let is_cycle = graph.cycle_edges.contains(&(node.to_string(), callee.clone()));
+        let is_cycle = graph
+            .cycle_edges
+            .contains(&(node.to_string(), callee.clone()));
         let is_revisit = visited.contains(callee);
 
         if is_cycle {
@@ -418,11 +563,8 @@ fn render_stats(graph: &CallGraph, verbose: bool) {
     }
 
     // Fan-out: functions that call the most others
-    let mut fan_out: Vec<(&String, usize)> = graph
-        .adjacency
-        .iter()
-        .map(|(k, v)| (k, v.len()))
-        .collect();
+    let mut fan_out: Vec<(&String, usize)> =
+        graph.adjacency.iter().map(|(k, v)| (k, v.len())).collect();
     fan_out.sort_by(|a, b| b.1.cmp(&a.1));
 
     if !fan_out.is_empty() {
@@ -431,18 +573,16 @@ fn render_stats(graph: &CallGraph, verbose: bool) {
         for (name, count) in fan_out.iter().take(8) {
             let bar_len = (*count).min(30);
             let bar = "█".repeat(bar_len);
-            println!(
-                "    {:<40} {} {}",
-                name.dimmed(),
-                bar.bright_blue(),
-                count,
-            );
+            println!("    {:<40} {} {}", name.dimmed(), bar.bright_blue(), count,);
         }
     }
 
     // Deepest call chains
     println!();
-    println!("  {} (longest call chains):", "Hot paths".bold().underline());
+    println!(
+        "  {} (longest call chains):",
+        "Hot paths".bold().underline()
+    );
     for entry in &graph.entry_points {
         let depth = measure_max_depth(graph, entry, &mut HashSet::new());
         let indicator = if depth > 6 {
@@ -459,11 +599,7 @@ fn render_stats(graph: &CallGraph, verbose: bool) {
 }
 
 /// Measure the maximum call depth from a given node.
-fn measure_max_depth(
-    graph: &CallGraph,
-    node: &str,
-    visited: &mut HashSet<String>,
-) -> usize {
+fn measure_max_depth(graph: &CallGraph, node: &str, visited: &mut HashSet<String>) -> usize {
     if visited.contains(node) {
         return 0;
     }
@@ -546,19 +682,22 @@ pub fn render_flow_json(rs_files: &[PathBuf], project_path: &Path) {
     let cycles: Vec<CallEdgeJson> = graph
         .cycle_edges
         .iter()
-        .map(|(a, b)| CallEdgeJson { caller: a.clone(), callee: b.clone() })
+        .map(|(a, b)| CallEdgeJson {
+            caller: a.clone(),
+            callee: b.clone(),
+        })
         .collect();
 
-    let mut fan_out: Vec<(&String, usize)> = graph
-        .adjacency
-        .iter()
-        .map(|(k, v)| (k, v.len()))
-        .collect();
+    let mut fan_out: Vec<(&String, usize)> =
+        graph.adjacency.iter().map(|(k, v)| (k, v.len())).collect();
     fan_out.sort_by(|a, b| b.1.cmp(&a.1));
     let top_callers: Vec<FanOutJson> = fan_out
         .iter()
         .take(20)
-        .map(|(f, c)| FanOutJson { function: (*f).clone(), call_count: *c })
+        .map(|(f, c)| FanOutJson {
+            function: (*f).clone(),
+            call_count: *c,
+        })
         .collect();
 
     let entry_depths: Vec<EntryDepthJson> = graph
@@ -566,7 +705,10 @@ pub fn render_flow_json(rs_files: &[PathBuf], project_path: &Path) {
         .iter()
         .map(|entry| {
             let depth = measure_max_depth(&graph, entry, &mut HashSet::new());
-            EntryDepthJson { entry_point: entry.clone(), max_depth: depth }
+            EntryDepthJson {
+                entry_point: entry.clone(),
+                max_depth: depth,
+            }
         })
         .collect();
 
@@ -577,10 +719,14 @@ pub fn render_flow_json(rs_files: &[PathBuf], project_path: &Path) {
         let mut reachable = HashSet::new();
         let mut queue: Vec<String> = graph.entry_points.clone();
         while let Some(node) = queue.pop() {
-            if !reachable.insert(node.clone()) { continue; }
+            if !reachable.insert(node.clone()) {
+                continue;
+            }
             if let Some(callees) = graph.adjacency.get(&node) {
                 for callee in callees {
-                    if !reachable.contains(callee) { queue.push(callee.clone()); }
+                    if !reachable.contains(callee) {
+                        queue.push(callee.clone());
+                    }
                 }
             }
         }
@@ -606,4 +752,81 @@ pub fn render_flow_json(rs_files: &[PathBuf], project_path: &Path) {
     };
 
     println!("{}", serde_json::to_string(&output).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_project(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cstat-flow-{name}-{unique}"));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn resolves_unqualified_sibling_call_when_suffix_is_ambiguous() {
+        let root = temp_project("sibling-run");
+        let main = root.join("src/main.rs");
+        fs::write(
+            &main,
+            r#"
+mod cli {
+    pub fn run_from_args<I>(args: I) -> std::process::ExitCode
+    where
+        I: IntoIterator<Item = String>,
+    {
+        install_signal_handlers();
+        match run(args) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("mvp-one-node-chat: {error}");
+                std::process::ExitCode::from(1)
+            }
+        }
+    }
+
+    fn install_signal_handlers() {}
+
+    fn run<I>(_args: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        Ok(())
+    }
+}
+
+mod worker {
+    fn run() {}
+}
+
+fn main() {}
+"#,
+        )
+        .unwrap();
+
+        let graph = build_call_graph(&[main], &root);
+        let callees = graph
+            .adjacency
+            .get("cli::run_from_args")
+            .expect("run_from_args should have outgoing edges");
+
+        assert!(
+            callees.contains(&"cli::run".to_string()),
+            "callee list did not include sibling run(): {callees:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -29,12 +29,16 @@ fn extract_metrics(fcs: &[FunctionComplexity]) -> MetricSet {
 // ── Statistics helpers ─────────────────────────────────────────────
 
 fn mean(v: &[f64]) -> f64 {
-    if v.is_empty() { return 0.0; }
+    if v.is_empty() {
+        return 0.0;
+    }
     v.iter().sum::<f64>() / v.len() as f64
 }
 
 fn std_dev(v: &[f64]) -> f64 {
-    if v.len() < 2 { return 0.0; }
+    if v.len() < 2 {
+        return 0.0;
+    }
     let m = mean(v);
     let var = v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / v.len() as f64;
     var.sqrt()
@@ -42,7 +46,9 @@ fn std_dev(v: &[f64]) -> f64 {
 
 fn pearson(x: &[f64], y: &[f64]) -> f64 {
     let n = x.len();
-    if n < 2 { return 0.0; }
+    if n < 2 {
+        return 0.0;
+    }
     let mx = mean(x);
     let my = mean(y);
     let mut num = 0.0;
@@ -56,25 +62,37 @@ fn pearson(x: &[f64], y: &[f64]) -> f64 {
         dy2 += dy * dy;
     }
     let denom = (dx2 * dy2).sqrt();
-    if denom < 1e-12 { 0.0 } else { num / denom }
+    if denom < 1e-12 {
+        0.0
+    } else {
+        num / denom
+    }
 }
 
 fn skewness(v: &[f64]) -> f64 {
     let n = v.len();
-    if n < 3 { return 0.0; }
+    if n < 3 {
+        return 0.0;
+    }
     let m = mean(v);
     let s = std_dev(v);
-    if s < 1e-12 { return 0.0; }
+    if s < 1e-12 {
+        return 0.0;
+    }
     let m3 = v.iter().map(|x| ((x - m) / s).powi(3)).sum::<f64>();
     m3 / n as f64
 }
 
 fn kurtosis(v: &[f64]) -> f64 {
     let n = v.len();
-    if n < 4 { return 0.0; }
+    if n < 4 {
+        return 0.0;
+    }
     let m = mean(v);
     let s = std_dev(v);
-    if s < 1e-12 { return 0.0; }
+    if s < 1e-12 {
+        return 0.0;
+    }
     let m4 = v.iter().map(|x| ((x - m) / s).powi(4)).sum::<f64>();
     m4 / n as f64 - 3.0 // excess kurtosis
 }
@@ -82,7 +100,9 @@ fn kurtosis(v: &[f64]) -> f64 {
 // ── Histogram ──────────────────────────────────────────────────────
 
 fn render_histogram(values: &[f64], label: &str, num_bins: usize, verbose: bool) {
-    if values.is_empty() { return; }
+    if values.is_empty() {
+        return;
+    }
 
     let min_v = values.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_v = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -95,7 +115,11 @@ fn render_histogram(values: &[f64], label: &str, num_bins: usize, verbose: bool)
         let int_range = range.ceil() as usize;
         num_bins.min(int_range.max(1))
     };
-    let bin_width = if num_bins == 1 { 1.0 } else { range / num_bins as f64 };
+    let bin_width = if num_bins == 1 {
+        1.0
+    } else {
+        range / num_bins as f64
+    };
 
     let mut bins = vec![0usize; num_bins];
     for &v in values {
@@ -146,9 +170,14 @@ fn render_histogram(values: &[f64], label: &str, num_bins: usize, verbose: bool)
             (bins[i] as f64 / max_count as f64 * bar_budget as f64).ceil() as usize
         } else {
             0
-        }.max(if bins[i] > 0 { 1 } else { 0 });
+        }
+        .max(if bins[i] > 0 { 1 } else { 0 });
 
-        let ratio = if max_count > 0 { 1.0 - (bins[i] as f64 / max_count as f64) } else { 1.0 };
+        let ratio = if max_count > 0 {
+            1.0 - (bins[i] as f64 / max_count as f64)
+        } else {
+            1.0
+        };
         let bar = render::bar_color(&"█".repeat(bar_len), ratio);
 
         println!(
@@ -168,14 +197,19 @@ fn render_histogram(values: &[f64], label: &str, num_bins: usize, verbose: bool)
     println!(
         "  {} mean={:.1} σ={:.1} skew={:.2} kurt={:.2}",
         "↳".dimmed(),
-        m, sd, sk, ku
+        m,
+        sd,
+        sk,
+        ku
     );
 }
 
 // ── Scatter plot ───────────────────────────────────────────────────
 
 fn render_scatter(x: &[f64], y: &[f64], x_label: &str, y_label: &str, verbose: bool) {
-    if x.is_empty() { return; }
+    if x.is_empty() {
+        return;
+    }
 
     let r = pearson(x, y);
 
@@ -204,8 +238,16 @@ fn render_scatter(x: &[f64], y: &[f64], x_label: &str, y_label: &str, verbose: b
     let y_min = y.iter().cloned().fold(f64::INFINITY, f64::min);
     let y_max = y.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
-    let x_range = if (x_max - x_min).abs() < 1e-12 { 1.0 } else { x_max - x_min };
-    let y_range = if (y_max - y_min).abs() < 1e-12 { 1.0 } else { y_max - y_min };
+    let x_range = if (x_max - x_min).abs() < 1e-12 {
+        1.0
+    } else {
+        x_max - x_min
+    };
+    let y_range = if (y_max - y_min).abs() < 1e-12 {
+        1.0
+    } else {
+        y_max - y_min
+    };
 
     // Build grid with counts
     let mut grid = vec![vec![0u32; plot_w]; plot_h];
@@ -295,7 +337,9 @@ fn render_outliers(fcs: &[FunctionComplexity], metrics: &MetricSet, verbose: boo
         let vals = &metrics.columns[mi];
         let m = mean(vals);
         let s = std_dev(vals);
-        if s < 1e-12 { continue; }
+        if s < 1e-12 {
+            continue;
+        }
 
         let mut outliers: Vec<(usize, f64)> = Vec::new();
         for (i, &v) in vals.iter().enumerate() {
@@ -308,8 +352,12 @@ fn render_outliers(fcs: &[FunctionComplexity], metrics: &MetricSet, verbose: boo
 
         if !outliers.is_empty() {
             any_outlier = true;
-            println!("\n  {} ({} outlier{})", metric_name.yellow().bold(), outliers.len(),
-                if outliers.len() == 1 { "" } else { "s" });
+            println!(
+                "\n  {} ({} outlier{})",
+                metric_name.yellow().bold(),
+                outliers.len(),
+                if outliers.len() == 1 { "" } else { "s" }
+            );
 
             for (i, z) in outliers.iter().take(5) {
                 let name = if fcs[*i].name.len() > 45 {
@@ -379,9 +427,17 @@ fn render_correlation_matrix(metrics: &MetricSet, verbose: bool) {
 fn color_correlation(text: &str, r: f64) -> String {
     let abs_r = r.abs();
     if abs_r > 0.7 {
-        if r > 0.0 { text.red().bold().to_string() } else { text.blue().bold().to_string() }
+        if r > 0.0 {
+            text.red().bold().to_string()
+        } else {
+            text.blue().bold().to_string()
+        }
     } else if abs_r > 0.4 {
-        if r > 0.0 { text.yellow().to_string() } else { text.cyan().to_string() }
+        if r > 0.0 {
+            text.yellow().to_string()
+        } else {
+            text.cyan().to_string()
+        }
     } else {
         text.dimmed().to_string()
     }
@@ -429,7 +485,13 @@ pub fn render_dist(
     );
 
     // Histograms
-    let labels = &["Function LoC", "Cyclomatic", "Cognitive", "Nesting Depth", "Param Count"];
+    let labels = &[
+        "Function LoC",
+        "Cyclomatic",
+        "Cognitive",
+        "Nesting Depth",
+        "Param Count",
+    ];
 
     if let Some(filter) = metric_filter {
         // Find the matching metric
@@ -511,7 +573,9 @@ struct DistJson {
 }
 
 fn compute_histogram_bins(values: &[f64], num_bins: usize) -> Vec<HistogramBinJson> {
-    if values.is_empty() { return vec![]; }
+    if values.is_empty() {
+        return vec![];
+    }
 
     let min_v = values.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_v = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -522,7 +586,11 @@ fn compute_histogram_bins(values: &[f64], num_bins: usize) -> Vec<HistogramBinJs
         let int_range = range.ceil() as usize;
         num_bins.min(int_range.max(1))
     };
-    let bin_width = if num_bins == 1 { 1.0 } else { range / num_bins as f64 };
+    let bin_width = if num_bins == 1 {
+        1.0
+    } else {
+        range / num_bins as f64
+    };
 
     let mut counts = vec![0usize; num_bins];
     for &v in values {
@@ -535,11 +603,17 @@ fn compute_histogram_bins(values: &[f64], num_bins: usize) -> Vec<HistogramBinJs
         counts[idx] += 1;
     }
 
-    (0..num_bins).map(|i| {
-        let lo = min_v + i as f64 * bin_width;
-        let hi = lo + bin_width;
-        HistogramBinJson { low: lo, high: hi, count: counts[i] }
-    }).collect()
+    (0..num_bins)
+        .map(|i| {
+            let lo = min_v + i as f64 * bin_width;
+            let hi = lo + bin_width;
+            HistogramBinJson {
+                low: lo,
+                high: hi,
+                count: counts[i],
+            }
+        })
+        .collect()
 }
 
 /// Render distribution analysis as JSON.
@@ -566,25 +640,30 @@ pub fn render_dist_json(
         (0..METRIC_NAMES.len()).collect()
     };
 
-    let histograms: Vec<HistogramJson> = indices.iter().map(|&i| {
-        let vals = &metrics.columns[i];
-        let bins_json = compute_histogram_bins(vals, num_bins);
-        HistogramJson {
-            metric: labels[i].to_string(),
-            bins: bins_json,
-            mean: mean(vals),
-            std_dev: std_dev(vals),
-            skewness: skewness(vals),
-            kurtosis: kurtosis(vals),
-        }
-    }).collect();
+    let histograms: Vec<HistogramJson> = indices
+        .iter()
+        .map(|&i| {
+            let vals = &metrics.columns[i];
+            let bins_json = compute_histogram_bins(vals, num_bins);
+            HistogramJson {
+                metric: labels[i].to_string(),
+                bins: bins_json,
+                mean: mean(vals),
+                std_dev: std_dev(vals),
+                skewness: skewness(vals),
+                kurtosis: kurtosis(vals),
+            }
+        })
+        .collect();
 
     let mut outliers_json: Vec<OutlierJson> = Vec::new();
     for (mi, metric_name) in METRIC_NAMES.iter().enumerate() {
         let vals = &metrics.columns[mi];
         let m = mean(vals);
         let s = std_dev(vals);
-        if s < 1e-12 { continue; }
+        if s < 1e-12 {
+            continue;
+        }
         for (i, &v) in vals.iter().enumerate() {
             let z = (v - m) / s;
             if z > 2.0 {
@@ -597,12 +676,16 @@ pub fn render_dist_json(
             }
         }
     }
-    outliers_json.sort_by(|a, b| b.z_score.partial_cmp(&a.z_score).unwrap_or(std::cmp::Ordering::Equal));
+    outliers_json.sort_by(|a, b| {
+        b.z_score
+            .partial_cmp(&a.z_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let n = METRIC_NAMES.len();
     let mut correlations: Vec<CorrelationEntryJson> = Vec::new();
     for i in 0..n {
-        for j in (i+1)..n {
+        for j in (i + 1)..n {
             let r = pearson(&metrics.columns[i], &metrics.columns[j]);
             correlations.push(CorrelationEntryJson {
                 metric_a: METRIC_NAMES[i].to_string(),

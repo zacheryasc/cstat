@@ -228,13 +228,18 @@ fn compute_call_cohesion(
         let mut callers_of_internal = 0usize;
         for func in funcs {
             if let Some(callees) = call_graph.adjacency.get(func) {
-                let calls_internal = callees.iter().any(|c| func_set.contains(c.as_str()) && c != func);
+                let calls_internal = callees
+                    .iter()
+                    .any(|c| func_set.contains(c.as_str()) && c != func);
                 if calls_internal {
                     callers_of_internal += 1;
                 }
             }
         }
-        call_cohesion_map.insert(module.clone(), callers_of_internal as f64 / funcs.len() as f64);
+        call_cohesion_map.insert(
+            module.clone(),
+            callers_of_internal as f64 / funcs.len() as f64,
+        );
     }
     call_cohesion_map
 }
@@ -250,18 +255,20 @@ fn compute_type_cohesion(
             continue;
         }
 
-        let func_types: Vec<HashSet<String>> = funcs.iter().map(|f| {
-            extract_param_types(&f.file, f.line_start, f.line_end)
-        }).collect();
+        let func_types: Vec<HashSet<String>> = funcs
+            .iter()
+            .map(|f| extract_param_types(&f.file, f.line_start, f.line_end))
+            .collect();
 
         let mut sharing_count = 0usize;
         for (i, types_i) in func_types.iter().enumerate() {
             if types_i.is_empty() {
                 continue;
             }
-            let shares = func_types.iter().enumerate().any(|(j, types_j)| {
-                i != j && !types_i.is_disjoint(types_j)
-            });
+            let shares = func_types
+                .iter()
+                .enumerate()
+                .any(|(j, types_j)| i != j && !types_i.is_disjoint(types_j));
             if shares {
                 sharing_count += 1;
             }
@@ -283,7 +290,10 @@ pub fn compute_cohesion(rs_files: &[PathBuf], project_path: &Path) -> Vec<Module
         } else {
             "main".to_string()
         };
-        module_functions.entry(module).or_default().push(func_name.clone());
+        module_functions
+            .entry(module)
+            .or_default()
+            .push(func_name.clone());
     }
 
     let call_cohesion_map = compute_call_cohesion(&module_functions, &call_graph);
@@ -292,33 +302,47 @@ pub fn compute_cohesion(rs_files: &[PathBuf], project_path: &Path) -> Vec<Module
     for file_syms in &symbols.files {
         let module_name = crate_render::module_name_from_path(&file_syms.path, project_path);
         for func in &file_syms.functions {
-            module_func_infos.entry(module_name.clone()).or_default().push(func);
+            module_func_infos
+                .entry(module_name.clone())
+                .or_default()
+                .push(func);
         }
     }
 
     let type_cohesion_map = compute_type_cohesion(&module_func_infos);
 
-    let all_modules: HashSet<&str> = module_functions.keys().map(|s| s.as_str())
+    let all_modules: HashSet<&str> = module_functions
+        .keys()
+        .map(|s| s.as_str())
         .chain(module_func_infos.keys().map(|s| s.as_str()))
         .collect();
 
-    let mut results: Vec<ModuleCohesion> = all_modules.iter().map(|&module| {
-        let call_c = call_cohesion_map.get(module).copied().unwrap_or(0.0);
-        let type_c = type_cohesion_map.get(module).copied().unwrap_or(0.0);
-        let func_count = module_functions.get(module).map(|v| v.len())
-            .or_else(|| module_func_infos.get(module).map(|v| v.len()))
-            .unwrap_or(0);
-        let combined = (0.6 * call_c + 0.4 * type_c).clamp(0.0, 1.0);
-        ModuleCohesion {
-            module: module.to_string(),
-            call_cohesion: call_c,
-            type_cohesion: type_c,
-            combined,
-            function_count: func_count,
-        }
-    }).collect();
+    let mut results: Vec<ModuleCohesion> = all_modules
+        .iter()
+        .map(|&module| {
+            let call_c = call_cohesion_map.get(module).copied().unwrap_or(0.0);
+            let type_c = type_cohesion_map.get(module).copied().unwrap_or(0.0);
+            let func_count = module_functions
+                .get(module)
+                .map(|v| v.len())
+                .or_else(|| module_func_infos.get(module).map(|v| v.len()))
+                .unwrap_or(0);
+            let combined = (0.6 * call_c + 0.4 * type_c).clamp(0.0, 1.0);
+            ModuleCohesion {
+                module: module.to_string(),
+                call_cohesion: call_c,
+                type_cohesion: type_c,
+                combined,
+                function_count: func_count,
+            }
+        })
+        .collect();
 
-    results.sort_by(|a, b| a.combined.partial_cmp(&b.combined).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        a.combined
+            .partial_cmp(&b.combined)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results
 }
 
@@ -339,15 +363,57 @@ fn extract_param_types(file: &Path, line_start: usize, line_end: usize) -> HashS
         if t.is_empty() || t.len() < 2 {
             continue;
         }
-        if matches!(t, "fn" | "pub" | "mut" | "self" | "let" | "if" | "else" | "for"
-            | "while" | "match" | "return" | "use" | "crate" | "super" | "as" | "in"
-            | "ref" | "where" | "impl" | "true" | "false" | "Some" | "None" | "Ok" | "Err") {
+        if matches!(
+            t,
+            "fn" | "pub"
+                | "mut"
+                | "self"
+                | "let"
+                | "if"
+                | "else"
+                | "for"
+                | "while"
+                | "match"
+                | "return"
+                | "use"
+                | "crate"
+                | "super"
+                | "as"
+                | "in"
+                | "ref"
+                | "where"
+                | "impl"
+                | "true"
+                | "false"
+                | "Some"
+                | "None"
+                | "Ok"
+                | "Err"
+        ) {
             continue;
         }
         if t.starts_with(|c: char| c.is_uppercase())
-            || matches!(t, "usize" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
-                | "i8" | "i16" | "i32" | "i64" | "i128" | "f32" | "f64"
-                | "bool" | "str" | "String") {
+            || matches!(
+                t,
+                "usize"
+                    | "isize"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "u128"
+                    | "i8"
+                    | "i16"
+                    | "i32"
+                    | "i64"
+                    | "i128"
+                    | "f32"
+                    | "f64"
+                    | "bool"
+                    | "str"
+                    | "String"
+            )
+        {
             types.insert(t.to_string());
         }
     }

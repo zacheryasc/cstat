@@ -7,7 +7,7 @@ use crate::flow;
 use crate::loc;
 use crate::redundancy;
 
-use super::{HealthScores, CYCLOMATIC, COGNITIVE, FILE_LOC, REDUNDANCY};
+use super::{HealthScores, COGNITIVE, CYCLOMATIC, FILE_LOC, REDUNDANCY};
 
 pub(super) fn compute_health_scores(
     file_stats: &[loc::FileLocStats],
@@ -21,8 +21,15 @@ pub(super) fn compute_health_scores(
 ) -> HealthScores {
     let modularity = compute_modularity_score(dep_analysis, rs_files, project_path);
     let complexity = compute_complexity_score(func_complexities);
-    let maintainability =
-        compute_maintainability_score(file_stats, func_complexities, redundant_pairs, call_graph, reachable, modularity, complexity);
+    let maintainability = compute_maintainability_score(
+        file_stats,
+        func_complexities,
+        redundant_pairs,
+        call_graph,
+        reachable,
+        modularity,
+        complexity,
+    );
 
     HealthScores {
         modularity,
@@ -113,16 +120,25 @@ fn compute_maintainability_score(
         .filter(|p| p.similarity > REDUNDANCY.alert)
         .count();
     let total_funcs = func_complexities.len().max(1);
-    let redundancy_ratio = (1.0 - (high_redundancy as f64 * 2.0 / total_funcs as f64)).clamp(0.0, 1.0);
+    let redundancy_ratio =
+        (1.0 - (high_redundancy as f64 * 2.0 / total_funcs as f64)).clamp(0.0, 1.0);
 
     let dead_ratio = if call_graph.functions.is_empty() {
         1.0
     } else {
-        let dead = call_graph.functions.iter().filter(|f| !reachable.contains(*f)).count();
+        let dead = call_graph
+            .functions
+            .iter()
+            .filter(|f| !reachable.contains(*f))
+            .count();
         (1.0 - dead as f64 / call_graph.functions.len() as f64).clamp(0.0, 1.0)
     };
 
-    (0.25 * modularity + 0.25 * complexity + 0.2 * file_ratio + 0.15 * redundancy_ratio + 0.15 * dead_ratio)
+    (0.25 * modularity
+        + 0.25 * complexity
+        + 0.2 * file_ratio
+        + 0.15 * redundancy_ratio
+        + 0.15 * dead_ratio)
         .clamp(0.0, 1.0)
 }
 

@@ -130,11 +130,7 @@ pub fn bar_color(text: &str, ratio: f64) -> String {
 
 /// Print a stat row in a `│ label │ value │` table with 11-char label, 12-char value.
 pub fn print_stat_row(label: &str, value: &str) {
-    println!(
-        "│ {:<11} │ {:>12} │",
-        label.cyan(),
-        value.bold()
-    );
+    println!("│ {:<11} │ {:>12} │", label.cyan(), value.bold());
 }
 
 /// Print a stat row with 16-char label column (used by complexity).
@@ -168,6 +164,8 @@ pub fn section_header(title: &str) {
     println!(
         "\n┌─ {} {}",
         title.bright_cyan().bold(),
-        "─".repeat(50usize.saturating_sub(title.len() + 3)).bright_cyan(),
+        "─"
+            .repeat(50usize.saturating_sub(title.len() + 3))
+            .bright_cyan(),
     );
 }

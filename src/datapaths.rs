@@ -4,8 +4,307 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::flow::{build_call_graph, CallGraph};
+use crate::flow::{self, build_call_graph, CallGraph, EntryPointKind};
 use crate::render;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TestReachabilityEntry {
+    pub entry: String,
+    pub kind: String,
+    pub reachable_functions: usize,
+    pub unique_call_steps: usize,
+    pub max_call_depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionReachabilityCount {
+    pub function: String,
+    pub reachable_from_count: usize,
+    pub reachable_from_entries: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EdgeReachabilityCount {
+    pub caller: String,
+    pub callee: String,
+    pub reachable_from_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TestReachabilityAnalysis {
+    pub total_functions: usize,
+    pub test_benchmark_entry_count: usize,
+    pub reachable_function_count: usize,
+    pub unreachable_function_count: usize,
+    pub entries: Vec<TestReachabilityEntry>,
+    pub function_reachability_counts: Vec<FunctionReachabilityCount>,
+    pub edge_reachability_counts: Vec<EdgeReachabilityCount>,
+    pub unreachable_functions: Vec<String>,
+    pub analysis_note: String,
+}
+
+pub fn analyze_test_reachability(
+    rs_files: &[PathBuf],
+    project_path: &Path,
+) -> TestReachabilityAnalysis {
+    let graph = build_call_graph(rs_files, project_path);
+    analyze_graph_test_reachability(&graph)
+}
+
+pub fn analyze_graph_test_reachability(graph: &CallGraph) -> TestReachabilityAnalysis {
+    let mut entry_roots = flow::entry_points_by_kind(graph, EntryPointKind::Test);
+    entry_roots.extend(flow::entry_points_by_kind(graph, EntryPointKind::Bench));
+    entry_roots.sort();
+    entry_roots.dedup();
+
+    let mut function_to_entries: HashMap<String, Vec<String>> = HashMap::new();
+    let mut edge_to_entries: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut entries = Vec::new();
+
+    for entry in &entry_roots {
+        let (reachable, edges) = reachable_subgraph(graph, entry);
+        for function in &reachable {
+            function_to_entries
+                .entry(function.clone())
+                .or_default()
+                .push(entry.clone());
+        }
+        for edge in &edges {
+            edge_to_entries
+                .entry(edge.clone())
+                .or_default()
+                .push(entry.clone());
+        }
+
+        let kind = graph
+            .entry_point_kinds
+            .get(entry)
+            .map(|k| k.as_str().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        entries.push(TestReachabilityEntry {
+            entry: entry.clone(),
+            kind,
+            reachable_functions: reachable.len(),
+            unique_call_steps: edges.len(),
+            max_call_depth: max_depth_from(graph, entry, &mut HashSet::new()),
+        });
+    }
+
+    entries.sort_by(|a, b| a.entry.cmp(&b.entry));
+
+    let mut function_reachability_counts: Vec<FunctionReachabilityCount> = graph
+        .functions
+        .iter()
+        .map(|function| {
+            let mut reachable_from_entries =
+                function_to_entries.remove(function).unwrap_or_default();
+            reachable_from_entries.sort();
+            reachable_from_entries.dedup();
+            FunctionReachabilityCount {
+                function: function.clone(),
+                reachable_from_count: reachable_from_entries.len(),
+                reachable_from_entries,
+            }
+        })
+        .collect();
+    function_reachability_counts.sort_by(|a, b| {
+        b.reachable_from_count
+            .cmp(&a.reachable_from_count)
+            .then(a.function.cmp(&b.function))
+    });
+
+    let mut edge_reachability_counts: Vec<EdgeReachabilityCount> = edge_to_entries
+        .into_iter()
+        .map(|((caller, callee), mut reachable_from_entries)| {
+            reachable_from_entries.sort();
+            reachable_from_entries.dedup();
+            EdgeReachabilityCount {
+                caller,
+                callee,
+                reachable_from_count: reachable_from_entries.len(),
+            }
+        })
+        .collect();
+    edge_reachability_counts.sort_by(|a, b| {
+        b.reachable_from_count
+            .cmp(&a.reachable_from_count)
+            .then(a.caller.cmp(&b.caller))
+            .then(a.callee.cmp(&b.callee))
+    });
+
+    let mut unreachable_functions: Vec<String> = function_reachability_counts
+        .iter()
+        .filter(|count| count.reachable_from_count == 0)
+        .map(|count| count.function.clone())
+        .collect();
+    unreachable_functions.sort();
+
+    TestReachabilityAnalysis {
+        total_functions: graph.functions.len(),
+        test_benchmark_entry_count: entry_roots.len(),
+        reachable_function_count: graph.functions.len().saturating_sub(unreachable_functions.len()),
+        unreachable_function_count: unreachable_functions.len(),
+        entries,
+        function_reachability_counts,
+        edge_reachability_counts,
+        unreachable_functions,
+        analysis_note: "Static test/benchmark reachability. Counts are how many test or benchmark entry roots can reach a function/edge, not runtime coverage or hit counts.".to_string(),
+    }
+}
+
+fn reachable_subgraph(
+    graph: &CallGraph,
+    entry: &str,
+) -> (HashSet<String>, HashSet<(String, String)>) {
+    let mut reachable = HashSet::new();
+    let mut edges = HashSet::new();
+    let mut stack = vec![entry.to_string()];
+
+    while let Some(node) = stack.pop() {
+        if !reachable.insert(node.clone()) {
+            continue;
+        }
+        if let Some(callees) = graph.adjacency.get(&node) {
+            for callee in callees {
+                edges.insert((node.clone(), callee.clone()));
+                if !reachable.contains(callee) {
+                    stack.push(callee.clone());
+                }
+            }
+        }
+    }
+
+    (reachable, edges)
+}
+
+fn max_depth_from(graph: &CallGraph, node: &str, visited: &mut HashSet<String>) -> usize {
+    if !visited.insert(node.to_string()) {
+        return 0;
+    }
+
+    let depth = graph
+        .adjacency
+        .get(node)
+        .map(|callees| {
+            callees
+                .iter()
+                .map(|callee| 1 + max_depth_from(graph, callee, visited))
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+
+    visited.remove(node);
+    depth
+}
+
+pub fn render_test_reachability_report(report: &TestReachabilityAnalysis, verbose: bool) {
+    render::section_header("Static test/benchmark reachability");
+
+    if verbose {
+        render::verbose_block(&[
+            "Each entry root is a #[test], #[bench], or function in benches/.",
+            "Reachability is computed from the static call graph; it is not runtime coverage.",
+            "Reachability count is how many test/bench roots can reach a function or edge.",
+        ]);
+    }
+
+    let reachability_pct = if report.total_functions == 0 {
+        0.0
+    } else {
+        report.reachable_function_count as f64 / report.total_functions as f64 * 100.0
+    };
+
+    println!(
+        "  {} {}  {} {} / {} ({:.1}%)  {} {}",
+        "test/bench roots".cyan(),
+        report.test_benchmark_entry_count.to_string().bold(),
+        "statically reachable".cyan(),
+        report.reachable_function_count.to_string().bold(),
+        report.total_functions,
+        reachability_pct,
+        "unreachable".cyan(),
+        report.unreachable_function_count.to_string().bold(),
+    );
+
+    if report.entries.is_empty() {
+        println!("  {}", "No test or benchmark entry roots found.".yellow());
+    } else {
+        println!();
+        println!(
+            "  {:<48} {:<7} {:>9} {:>7} {:>8}",
+            "entry root".bold(),
+            "kind".bold(),
+            "functions".bold(),
+            "steps".bold(),
+            "depth".bold(),
+        );
+        for entry in &report.entries {
+            println!(
+                "  {:<48} {:<7} {:>9} {:>7} {:>8}",
+                truncate(&entry.entry, 48),
+                entry.kind,
+                entry.reachable_functions,
+                entry.unique_call_steps,
+                entry.max_call_depth,
+            );
+        }
+    }
+
+    let reachable_functions: Vec<&FunctionReachabilityCount> = report
+        .function_reachability_counts
+        .iter()
+        .filter(|count| count.reachable_from_count > 0)
+        .take(20)
+        .collect();
+    if !reachable_functions.is_empty() {
+        println!();
+        println!("  {}", "Functions reachable from most entry roots:".bold());
+        for count in reachable_functions {
+            println!(
+                "  {:>3}×  {}",
+                count.reachable_from_count,
+                truncate(&count.function, 70)
+            );
+        }
+    }
+
+    if !report.unreachable_functions.is_empty() {
+        println!();
+        println!(
+            "  {}",
+            "Not statically reachable from tests/benches:"
+                .bold()
+                .yellow()
+        );
+        for function in report.unreachable_functions.iter().take(20) {
+            println!("  {} {}", "•".yellow(), function);
+        }
+        if report.unreachable_functions.len() > 20 {
+            println!("  … +{} more", report.unreachable_functions.len() - 20);
+        }
+    }
+}
+
+pub fn render_test_reachability(rs_files: &[PathBuf], project_path: &Path, verbose: bool) {
+    let report = analyze_test_reachability(rs_files, project_path);
+    render_test_reachability_report(&report, verbose);
+}
+
+pub fn render_test_reachability_json(rs_files: &[PathBuf], project_path: &Path) {
+    let report = analyze_test_reachability(rs_files, project_path);
+    println!("{}", serde_json::to_string(&report).unwrap());
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        value.to_string()
+    } else {
+        let mut out: String = value.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
 
 /// Run many random walks through the call graph and accumulate visit counts.
 fn simulate_walks(
@@ -19,9 +318,11 @@ fn simulate_walks(
     for (ep_idx, entry) in entry_points.iter().enumerate() {
         let walks_per_entry = num_walks / entry_points.len().max(1);
         for walk_i in 0..walks_per_entry {
-            rng_state = rng_state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add((ep_idx as u64).wrapping_mul(1442695040888963407).wrapping_add(walk_i as u64));
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(
+                (ep_idx as u64)
+                    .wrapping_mul(1442695040888963407)
+                    .wrapping_add(walk_i as u64),
+            );
             let mut current = entry.clone();
             let mut steps = 0;
             let max_steps = 200;
@@ -52,11 +353,7 @@ fn simulate_walks(
 }
 
 /// Run walks from a single entry point.
-fn simulate_walks_from(
-    graph: &CallGraph,
-    entry: &str,
-    num_walks: usize,
-) -> HashMap<String, usize> {
+fn simulate_walks_from(graph: &CallGraph, entry: &str, num_walks: usize) -> HashMap<String, usize> {
     let mut visit_counts: HashMap<String, usize> = HashMap::new();
     let mut rng_state: u64 = 0xcafebabe_u64;
 
@@ -92,7 +389,11 @@ fn simulate_walks_from(
 }
 
 /// Find the hot path: greedily follow highest-visit-count callees from entry.
-fn find_hot_path(graph: &CallGraph, entry: &str, visit_counts: &HashMap<String, usize>) -> Vec<String> {
+fn find_hot_path(
+    graph: &CallGraph,
+    entry: &str,
+    visit_counts: &HashMap<String, usize>,
+) -> Vec<String> {
     let mut path = vec![entry.to_string()];
     let mut visited = HashSet::new();
     visited.insert(entry.to_string());
@@ -260,7 +561,8 @@ fn render_per_entry(graph: &CallGraph, num_walks: usize, verbose: bool) {
         let mut ranked: Vec<(&String, &usize)> = counts.iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(a.1));
 
-        println!("\n  {} (reached {} functions, {} total visits)",
+        println!(
+            "\n  {} (reached {} functions, {} total visits)",
             entry.bold().bright_white(),
             counts.len(),
             total,
@@ -304,7 +606,11 @@ fn render_hot_paths(graph: &CallGraph, visit_counts: &HashMap<String, usize>, ve
     for entry in &graph.entry_points {
         let path = find_hot_path(graph, entry, visit_counts);
         if path.len() <= 1 {
-            println!("\n  {} → {}", entry.bold().bright_white(), "(no callees)".dimmed());
+            println!(
+                "\n  {} → {}",
+                entry.bold().bright_white(),
+                "(no callees)".dimmed()
+            );
             continue;
         }
 
@@ -364,7 +670,10 @@ fn render_cold_functions(graph: &CallGraph, visit_counts: &HashMap<String, usize
     }
 
     if cold.is_empty() {
-        println!("  {}", "All functions are reachable from entry points.".green());
+        println!(
+            "  {}",
+            "All functions are reachable from entry points.".green()
+        );
     } else {
         println!(
             "\n  {} functions never reached from any entry point (dead code candidates):\n",
@@ -434,9 +743,10 @@ pub fn render_datapaths(
     // Determine entry points
     let entries: Vec<String> = if let Some(f) = from_fn {
         // Check if the function exists (exact or suffix match)
-        let matched = graph.functions.iter().find(|name| {
-            *name == f || name.ends_with(&format!("::{}", f))
-        });
+        let matched = graph
+            .functions
+            .iter()
+            .find(|name| *name == f || name.ends_with(&format!("::{}", f)));
         match matched {
             Some(m) => vec![m.clone()],
             None => {
@@ -517,9 +827,10 @@ pub fn render_datapaths_json(
     let total_functions = graph.functions.len();
 
     let entries: Vec<String> = if let Some(f) = from_fn {
-        let matched = graph.functions.iter().find(|name| {
-            *name == f || name.ends_with(&format!("::{}", f))
-        });
+        let matched = graph
+            .functions
+            .iter()
+            .find(|name| *name == f || name.ends_with(&format!("::{}", f)));
         match matched {
             Some(m) => vec![m.clone()],
             None => vec![],
@@ -539,7 +850,11 @@ pub fn render_datapaths_json(
         .map(|(name, count)| VisitCountJson {
             function: (*name).clone(),
             visits: **count,
-            percentage: if total_visits > 0 { **count as f64 / total_visits as f64 * 100.0 } else { 0.0 },
+            percentage: if total_visits > 0 {
+                **count as f64 / total_visits as f64 * 100.0
+            } else {
+                0.0
+            },
         })
         .collect();
 
@@ -569,4 +884,80 @@ pub fn render_datapaths_json(
     };
 
     println!("{}", serde_json::to_string(&output).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_project(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cstat-{name}-{unique}"));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn static_test_reachability_counts_entry_roots_steps_and_frequency() {
+        let root = temp_project("datapaths");
+        let lib = root.join("src/lib.rs");
+        fs::write(
+            &lib,
+            r#"
+fn target() {
+    helper();
+}
+
+fn helper() {}
+
+mod tests {
+    #[test]
+    fn covers_target() {
+        target();
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let graph = build_call_graph(&[lib], &root);
+        let analysis = analyze_graph_test_reachability(&graph);
+
+        assert_eq!(analysis.test_benchmark_entry_count, 1);
+        assert_eq!(analysis.reachable_function_count, 3);
+        assert_eq!(analysis.unreachable_function_count, 0);
+
+        let entry = analysis
+            .entries
+            .iter()
+            .find(|entry| entry.entry == "tests::covers_target")
+            .unwrap();
+        assert_eq!(entry.kind, "test");
+        assert_eq!(entry.reachable_functions, 3);
+        assert_eq!(entry.unique_call_steps, 2);
+        assert_eq!(entry.max_call_depth, 2);
+
+        let helper = analysis
+            .function_reachability_counts
+            .iter()
+            .find(|count| count.function == "helper")
+            .unwrap();
+        assert_eq!(helper.reachable_from_count, 1);
+        assert_eq!(
+            helper.reachable_from_entries,
+            vec!["tests::covers_target".to_string()]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
