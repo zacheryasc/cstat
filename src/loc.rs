@@ -1,10 +1,11 @@
 use colored::Colorize;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::render;
-
+use crate::{ast_parser, datapaths, file_metrics, flow, render};
 /// Per-file line count data.
+#[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub struct FileLocStats {
     pub path: PathBuf,
@@ -55,6 +56,24 @@ struct LocJson {
     directory_breakdown: Vec<DirBreakdownJson>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct FileLineSpan {
+    pub function: String,
+    pub line_start: usize,
+    pub line_end: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileProjectedLineReachabilityReport {
+    pub file: String,
+    pub total_lines: usize,
+    pub code_lines: usize,
+    pub projected_reachable_lines: usize,
+    pub projected_unreachable_lines: usize,
+    pub reachable_spans: Vec<FileLineSpan>,
+    pub unreachable_spans: Vec<FileLineSpan>,
+}
+
 /// Classify a single trimmed line as code or non-code, tracking block comment state.
 /// Returns `(is_code, new_in_block_comment)`.
 fn classify_line(trimmed: &str, in_block_comment: bool) -> (bool, bool) {
@@ -90,7 +109,7 @@ fn classify_line(trimmed: &str, in_block_comment: bool) -> (bool, bool) {
 }
 
 /// Count lines in a single file. Code lines exclude blank lines and comment-only lines.
-fn count_lines(path: &Path) -> Option<FileLocStats> {
+pub fn count_file_lines(path: &Path) -> Option<FileLocStats> {
     let content = std::fs::read_to_string(path).ok()?;
     let total_lines = content.lines().count();
     let mut code_lines = 0usize;
@@ -108,6 +127,93 @@ fn count_lines(path: &Path) -> Option<FileLocStats> {
         path: path.to_path_buf(),
         total_lines,
         code_lines,
+    })
+}
+
+fn count_lines(path: &Path) -> Option<FileLocStats> {
+    count_file_lines(path)
+}
+
+fn code_lines_in_spans(path: &Path, spans: &[(usize, usize)]) -> HashSet<usize> {
+    if spans.is_empty() {
+        return HashSet::new();
+    }
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return HashSet::new(),
+    };
+
+    let mut covered = HashSet::new();
+    let mut in_block_comment = false;
+
+    for (index, line) in content.lines().enumerate() {
+        let line_number = index + 1;
+        let (is_code, new_in_block) = classify_line(line.trim(), in_block_comment);
+        in_block_comment = new_in_block;
+        if !is_code {
+            continue;
+        }
+
+        if spans
+            .iter()
+            .any(|(start, end)| line_number >= *start && line_number <= *end)
+        {
+            covered.insert(line_number);
+        }
+    }
+
+    covered
+}
+
+pub fn analyze_file_projected_line_reachability(
+    file: &Path,
+    file_functions: &file_metrics::FileFunctionIndex,
+    reachable_functions: &HashSet<String>,
+    file_display_path: &str,
+) -> Option<FileProjectedLineReachabilityReport> {
+    let file_stats = count_file_lines(file)?;
+    let mut reachable_spans = Vec::new();
+    let mut unreachable_spans = Vec::new();
+    let mut production_ranges = Vec::new();
+    let mut reachable_ranges = Vec::new();
+
+    for function in &file_functions.functions {
+        if function.is_test
+            || function.is_bench
+            || function.is_test_support
+            || function.is_binary_wrapper_main
+        {
+            continue;
+        }
+
+        production_ranges.push((function.line_start, function.line_end));
+        let span = FileLineSpan {
+            function: function.display_name.clone(),
+            line_start: function.line_start,
+            line_end: function.line_end,
+        };
+
+        if reachable_functions.contains(&function.graph_name) {
+            reachable_ranges.push((function.line_start, function.line_end));
+            reachable_spans.push(span);
+        } else {
+            unreachable_spans.push(span);
+        }
+    }
+
+    let code_lines = code_lines_in_spans(file, &production_ranges).len();
+    let projected_reachable_lines = code_lines_in_spans(file, &reachable_ranges).len();
+    let projected_unreachable_lines = code_lines.saturating_sub(projected_reachable_lines);
+
+    Some(FileProjectedLineReachabilityReport {
+        file: file_display_path.to_string(),
+        total_lines: file_stats.total_lines,
+        code_lines,
+        projected_reachable_lines,
+        projected_unreachable_lines,
+        reachable_spans,
+        unreachable_spans,
     })
 }
 
@@ -354,6 +460,117 @@ pub fn render_loc_json(files: &[PathBuf], project_path: &Path) {
     };
 
     println!("{}", serde_json::to_string(&output).unwrap());
+}
+
+pub fn render_loc_file(rs_files: &[PathBuf], project_path: &Path, file: &Path, verbose: bool) {
+    let report = analyze_file_projected_line_reachability_from_files(rs_files, project_path, file);
+    render_file_projected_line_reachability_report(&report, verbose);
+}
+
+pub fn render_loc_file_json(rs_files: &[PathBuf], project_path: &Path, file: &Path) {
+    if let Some(report) =
+        analyze_file_projected_line_reachability_from_files(rs_files, project_path, file)
+    {
+        println!("{}", serde_json::to_string(&report).unwrap());
+    } else {
+        println!("null");
+    }
+}
+
+pub fn analyze_file_projected_line_reachability_from_files(
+    rs_files: &[PathBuf],
+    project_path: &Path,
+    file: &Path,
+) -> Option<FileProjectedLineReachabilityReport> {
+    let symbols = ast_parser::parse_project(rs_files);
+    let graph = flow::build_call_graph(rs_files, project_path);
+    let file_functions =
+        file_metrics::selected_file_functions(&symbols, &graph, project_path, file);
+    let file_display_path = relative_path_string(project_path, file);
+    let static_reachability =
+        datapaths::analyze_file_static_reachability(&graph, &file_functions, &file_display_path);
+    let reachable_functions: HashSet<String> = static_reachability
+        .reachable_functions
+        .iter()
+        .cloned()
+        .collect();
+    analyze_file_projected_line_reachability(
+        file,
+        &file_functions,
+        &reachable_functions,
+        &file_display_path,
+    )
+}
+
+pub fn render_file_projected_line_reachability_report(
+    report: &Option<FileProjectedLineReachabilityReport>,
+    verbose: bool,
+) {
+    render::section_header("Projected line reachability");
+
+    if verbose {
+        render::verbose_block(&[
+            "Physical lines count every source line in the selected file.",
+            "Code lines exclude blank/comment-only lines and test/support/wrapper spans for selected-file production accounting.",
+            "Projected reachable lines are production code lines inside functions statically reached from project tests/benches.",
+        ]);
+    }
+
+    let Some(report) = report else {
+        println!("  {}", "Unable to read selected file.".yellow());
+        return;
+    };
+
+    let pct = if report.code_lines == 0 {
+        0.0
+    } else {
+        report.projected_reachable_lines as f64 / report.code_lines as f64 * 100.0
+    };
+
+    println!("  file {}", report.file.bold());
+    println!("  physical lines {}", report.total_lines);
+    println!("  production code lines {}", report.code_lines);
+    println!(
+        "  statically reachable lines {} / {} ({:.1}%)",
+        report.projected_reachable_lines, report.code_lines, pct
+    );
+    println!(
+        "  not statically reachable lines {}",
+        report.projected_unreachable_lines
+    );
+
+    println!();
+    println!("  {}", "reachable function spans:".bold());
+    if report.reachable_spans.is_empty() {
+        println!("  {}", "<none>".dimmed());
+    } else {
+        for span in &report.reachable_spans {
+            println!(
+                "  {} lines {}-{}",
+                span.function, span.line_start, span.line_end
+            );
+        }
+    }
+
+    println!();
+    println!("  {}", "unreachable function spans:".bold().yellow());
+    if report.unreachable_spans.is_empty() {
+        println!("  {}", "<none>".dimmed());
+    } else {
+        for span in &report.unreachable_spans {
+            println!(
+                "  {} lines {}-{}",
+                span.function, span.line_start, span.line_end
+            );
+        }
+    }
+}
+
+fn relative_path_string(project_path: &Path, path: &Path) -> String {
+    path.strip_prefix(project_path)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 // ── Treemap Visualization ────────────────────────────────────────────

@@ -21,6 +21,7 @@ pub struct FunctionInfo {
     pub return_type_complexity: usize,
     pub line_start: usize,
     pub line_end: usize,
+    pub is_test_support: bool,
 }
 
 /// Extracted information about a struct.
@@ -55,6 +56,22 @@ pub struct TraitInfo {
     pub generic_param_count: usize,
 }
 
+/// Extracted information about a const item.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ConstInfo {
+    pub name: String,
+    pub file: PathBuf,
+}
+
+/// Extracted information about a static item.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct StaticInfo {
+    pub name: String,
+    pub file: PathBuf,
+}
+
 /// Extracted information about an impl block.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -75,6 +92,8 @@ pub struct FileSymbols {
     pub enums: Vec<EnumInfo>,
     pub traits: Vec<TraitInfo>,
     pub impls: Vec<ImplInfo>,
+    pub consts: Vec<ConstInfo>,
+    pub statics: Vec<StaticInfo>,
     pub parse_error: bool,
 }
 
@@ -108,6 +127,8 @@ fn parse_file(path: &Path) -> FileSymbols {
                 enums: vec![],
                 traits: vec![],
                 impls: vec![],
+                consts: vec![],
+                statics: vec![],
                 parse_error: true,
             };
         }
@@ -123,6 +144,8 @@ fn parse_file(path: &Path) -> FileSymbols {
                 enums: vec![],
                 traits: vec![],
                 impls: vec![],
+                consts: vec![],
+                statics: vec![],
                 parse_error: true,
             };
         }
@@ -135,7 +158,11 @@ fn parse_file(path: &Path) -> FileSymbols {
         enums: vec![],
         traits: vec![],
         impls: vec![],
+        consts: vec![],
+        statics: vec![],
         module_parts: vec![],
+        in_cfg_test: false,
+        in_tests_module: false,
     };
 
     for item in &ast.items {
@@ -149,6 +176,8 @@ fn parse_file(path: &Path) -> FileSymbols {
         enums: extractor.enums,
         traits: extractor.traits,
         impls: extractor.impls,
+        consts: extractor.consts,
+        statics: extractor.statics,
         parse_error: false,
     }
 }
@@ -160,7 +189,11 @@ struct SymbolExtractor {
     enums: Vec<EnumInfo>,
     traits: Vec<TraitInfo>,
     impls: Vec<ImplInfo>,
+    consts: Vec<ConstInfo>,
+    statics: Vec<StaticInfo>,
     module_parts: Vec<String>,
+    in_cfg_test: bool,
+    in_tests_module: bool,
 }
 
 impl SymbolExtractor {
@@ -168,8 +201,15 @@ impl SymbolExtractor {
         match item {
             Item::Fn(func) => {
                 let name = self.qualify_name(&func.sig.ident.to_string());
-                let info =
-                    extract_function_info(&name, &self.file_path, &func.sig, Some(&func.block));
+                let is_test_support =
+                    self.is_test_support_context() || has_cfg_test_attr(&func.attrs);
+                let info = extract_function_info(
+                    &name,
+                    &self.file_path,
+                    &func.sig,
+                    Some(&func.block),
+                    is_test_support,
+                );
                 self.functions.push(info);
             }
             Item::Struct(s) => {
@@ -213,6 +253,18 @@ impl SymbolExtractor {
                     generic_param_count,
                 });
             }
+            Item::Const(c) => {
+                self.consts.push(ConstInfo {
+                    name: self.qualify_name(&c.ident.to_string()),
+                    file: self.file_path.clone(),
+                });
+            }
+            Item::Static(s) => {
+                self.statics.push(StaticInfo {
+                    name: self.qualify_name(&s.ident.to_string()),
+                    file: self.file_path.clone(),
+                });
+            }
             Item::Impl(imp) => {
                 let target_type = self.qualify_name(&type_to_string(&imp.self_ty));
                 let trait_name = imp.trait_.as_ref().map(|(_, path, _)| {
@@ -232,6 +284,9 @@ impl SymbolExtractor {
                             &self.file_path,
                             &method.sig,
                             Some(&method.block),
+                            self.is_test_support_context()
+                                || has_cfg_test_attr(&method.attrs)
+                                || has_cfg_test_attr(&imp.attrs),
                         );
                         self.functions.push(info);
                     }
@@ -245,11 +300,17 @@ impl SymbolExtractor {
             }
             Item::Mod(module) => {
                 if let Some((_, items)) = &module.content {
+                    let previous_cfg = self.in_cfg_test;
+                    let previous_tests = self.in_tests_module;
+                    self.in_cfg_test |= has_cfg_test_attr(&module.attrs);
+                    self.in_tests_module |= module.ident == "tests";
                     self.module_parts.push(module.ident.to_string());
                     for item in items {
                         self.extract_item(item);
                     }
                     self.module_parts.pop();
+                    self.in_cfg_test = previous_cfg;
+                    self.in_tests_module = previous_tests;
                 }
             }
             _ => {}
@@ -263,6 +324,10 @@ impl SymbolExtractor {
             format!("{}::{}", self.module_parts.join("::"), name)
         }
     }
+
+    fn is_test_support_context(&self) -> bool {
+        self.in_cfg_test || self.in_tests_module
+    }
 }
 
 fn extract_function_info(
@@ -270,6 +335,7 @@ fn extract_function_info(
     file: &Path,
     sig: &syn::Signature,
     body: Option<&syn::Block>,
+    is_test_support: bool,
 ) -> FunctionInfo {
     let param_count = sig.inputs.len();
     let generic_param_count = sig.generics.params.len();
@@ -314,12 +380,26 @@ fn extract_function_info(
         return_type_complexity,
         line_start,
         line_end,
+        is_test_support,
     }
 }
 
 /// Count derives from attributes.
 fn count_derives(attrs: &[syn::Attribute]) -> usize {
     attrs.iter().filter(|a| a.path().is_ident("derive")).count()
+}
+
+fn has_cfg_test_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "cfg")
+            && match &attr.meta {
+                syn::Meta::List(list) => list.tokens.to_string().contains("test"),
+                _ => false,
+            }
+    })
 }
 
 /// Count trait bounds across all generic parameters.

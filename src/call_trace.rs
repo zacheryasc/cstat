@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::ast_parser;
+use crate::file_metrics;
 use crate::flow::{self, CallGraph};
 use crate::render;
 
@@ -27,10 +28,25 @@ enum EntrySource {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct TraceNode {
-    function: String,
-    cycle: bool,
-    children: Vec<TraceNode>,
+pub struct TraceNode {
+    pub function: String,
+    pub cycle: bool,
+    pub children: Vec<TraceNode>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionTraceSummary {
+    pub function: String,
+    pub functions_reached: usize,
+    pub max_depth: usize,
+    pub direct_callees: Vec<String>,
+    pub tree: TraceNode,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileCallTraceReport {
+    pub file: String,
+    pub functions: Vec<FunctionTraceSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,6 +164,121 @@ fn analyze(
         functions_reached,
         max_depth,
     })
+}
+
+pub fn run_file(
+    rs_files: &[PathBuf],
+    project_path: &Path,
+    file: &Path,
+    entry: Option<&str>,
+    json: bool,
+    verbose: bool,
+) -> Result<(), String> {
+    let symbols = ast_parser::parse_project(rs_files);
+    let graph = flow::build_call_graph(rs_files, project_path);
+    let file_functions =
+        file_metrics::selected_file_functions(&symbols, &graph, project_path, file);
+    let file_display_path = relative_path_string(project_path, file);
+    let report = analyze_file_call_traces(&graph, &file_functions, &file_display_path);
+
+    let output = if let Some(entry) = entry {
+        let function = resolve_file_entry(&report, entry)?;
+        FileCallTraceReport {
+            file: report.file.clone(),
+            functions: vec![function.clone()],
+        }
+    } else {
+        report
+    };
+
+    if json {
+        println!("{}", serde_json::to_string(&output).unwrap());
+    } else {
+        render_file_call_trace_report(&output, verbose);
+    }
+
+    Ok(())
+}
+
+pub fn analyze_file_call_traces(
+    graph: &CallGraph,
+    file_functions: &file_metrics::FileFunctionIndex,
+    file_display_path: &str,
+) -> FileCallTraceReport {
+    let mut functions: Vec<FunctionTraceSummary> = file_functions
+        .functions
+        .iter()
+        .filter(|function| !function.is_test && !function.is_bench)
+        .map(|function| {
+            let direct_callees = graph
+                .adjacency
+                .get(&function.graph_name)
+                .cloned()
+                .unwrap_or_default();
+            let (tree, functions_reached, max_depth) =
+                if graph.functions.contains(&function.graph_name) {
+                    build_trace_tree(graph, &function.graph_name)
+                } else {
+                    (
+                        TraceNode {
+                            function: function.graph_name.clone(),
+                            cycle: false,
+                            children: Vec::new(),
+                        },
+                        1,
+                        1,
+                    )
+                };
+
+            FunctionTraceSummary {
+                function: function.display_name.clone(),
+                functions_reached,
+                max_depth,
+                direct_callees,
+                tree,
+            }
+        })
+        .collect();
+
+    functions.sort_by(|a, b| {
+        b.functions_reached
+            .cmp(&a.functions_reached)
+            .then(b.max_depth.cmp(&a.max_depth))
+            .then(a.function.cmp(&b.function))
+    });
+
+    FileCallTraceReport {
+        file: file_display_path.to_string(),
+        functions,
+    }
+}
+
+fn resolve_file_entry(
+    report: &FileCallTraceReport,
+    requested: &str,
+) -> Result<FunctionTraceSummary, String> {
+    if let Some(exact) = report
+        .functions
+        .iter()
+        .find(|function| function.function == requested)
+    {
+        return Ok(exact.clone());
+    }
+
+    let suffix = format!("::{requested}");
+    let matches: Vec<&FunctionTraceSummary> = report
+        .functions
+        .iter()
+        .filter(|function| function.function.ends_with(&suffix) || function.function == requested)
+        .collect();
+
+    if matches.len() == 1 {
+        Ok(matches[0].clone())
+    } else {
+        Err(format!(
+            "entry function not found or ambiguous: {requested}"
+        ))
+    }
 }
 fn maybe_entry_listing(
     project_path: &Path,
@@ -545,14 +676,14 @@ fn main_function_name(project_path: &Path, path: &Path) -> String {
     }
 }
 
-fn relative_path_string(project_path: &Path, path: &Path) -> String {
+pub(crate) fn relative_path_string(project_path: &Path, path: &Path) -> String {
     path.strip_prefix(project_path)
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
 }
 
-fn build_trace_tree(graph: &CallGraph, entry: &str) -> (TraceNode, usize, usize) {
+pub(crate) fn build_trace_tree(graph: &CallGraph, entry: &str) -> (TraceNode, usize, usize) {
     let mut stack = HashSet::new();
     let mut reached = HashSet::new();
     stack.insert(entry.to_string());
@@ -676,6 +807,37 @@ fn render_human(output: &CallTraceJson, verbose: bool) {
     println!("summary:");
     println!("  functions reached: {}", output.functions_reached);
     println!("  max depth: {}", output.max_depth);
+}
+
+fn render_file_call_trace_report(report: &FileCallTraceReport, verbose: bool) {
+    println!("cstat file call trace ({})", report.file);
+    if verbose {
+        render::verbose_block(&[
+            "Static call graph rendered for every non-test function in the selected file.",
+            "Cycles stop expansion; shared functions expand in each stack.",
+        ]);
+    }
+
+    if report.functions.is_empty() {
+        println!("  <none>");
+        return;
+    }
+
+    for function in &report.functions {
+        println!();
+        println!(
+            "{} (functions reached: {}, max depth: {}, direct callees: {})",
+            function.function,
+            function.functions_reached,
+            function.max_depth,
+            if function.direct_callees.is_empty() {
+                "-".to_string()
+            } else {
+                function.direct_callees.join(", ")
+            }
+        );
+        render_trace_node(&function.tree);
+    }
 }
 
 fn render_trace_node(node: &TraceNode) {

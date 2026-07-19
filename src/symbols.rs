@@ -34,6 +34,38 @@ pub struct SymbolReport {
     pub files: Vec<FileSymbolCounts>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSymbolKind {
+    Fn,
+    Struct,
+    Enum,
+    Trait,
+    Const,
+    Static,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileSymbolRow {
+    pub kind: FileSymbolKind,
+    pub symbol: String,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileSymbolReport {
+    pub file: String,
+    pub total: usize,
+    pub functions: usize,
+    pub structs: usize,
+    pub enums: usize,
+    pub traits: usize,
+    pub consts: usize,
+    pub statics: usize,
+    pub symbols: Vec<FileSymbolRow>,
+}
+
 pub fn analyze_symbols(symbols: &ProjectSymbols, project_path: &Path) -> SymbolReport {
     let mut files: Vec<FileSymbolCounts> = symbols
         .files
@@ -80,6 +112,97 @@ pub fn analyze_symbols(symbols: &ProjectSymbols, project_path: &Path) -> SymbolR
 pub fn analyze_files(rs_files: &[PathBuf], project_path: &Path) -> SymbolReport {
     let symbols = ast_parser::parse_project(rs_files);
     analyze_symbols(&symbols, project_path)
+}
+
+pub fn analyze_symbols_file(
+    symbols: &ast_parser::ProjectSymbols,
+    project_path: &Path,
+    file: &Path,
+) -> FileSymbolReport {
+    let file_display = relative_path_string(project_path, file);
+    let Some(file_symbols) = symbols.files.iter().find(|entry| entry.path == file) else {
+        return FileSymbolReport {
+            file: file_display,
+            total: 0,
+            functions: 0,
+            structs: 0,
+            enums: 0,
+            traits: 0,
+            consts: 0,
+            statics: 0,
+            symbols: Vec::new(),
+        };
+    };
+
+    let mut rows = Vec::new();
+    for function in &file_symbols.functions {
+        rows.push(FileSymbolRow {
+            kind: FileSymbolKind::Fn,
+            symbol: function.name.clone(),
+            line_start: Some(function.line_start),
+            line_end: Some(function.line_end),
+        });
+    }
+    for item in &file_symbols.structs {
+        rows.push(FileSymbolRow {
+            kind: FileSymbolKind::Struct,
+            symbol: item.name.clone(),
+            line_start: None,
+            line_end: None,
+        });
+    }
+    for item in &file_symbols.enums {
+        rows.push(FileSymbolRow {
+            kind: FileSymbolKind::Enum,
+            symbol: item.name.clone(),
+            line_start: None,
+            line_end: None,
+        });
+    }
+    for item in &file_symbols.traits {
+        rows.push(FileSymbolRow {
+            kind: FileSymbolKind::Trait,
+            symbol: item.name.clone(),
+            line_start: None,
+            line_end: None,
+        });
+    }
+    for item in &file_symbols.consts {
+        rows.push(FileSymbolRow {
+            kind: FileSymbolKind::Const,
+            symbol: item.name.clone(),
+            line_start: None,
+            line_end: None,
+        });
+    }
+    for item in &file_symbols.statics {
+        rows.push(FileSymbolRow {
+            kind: FileSymbolKind::Static,
+            symbol: item.name.clone(),
+            line_start: None,
+            line_end: None,
+        });
+    }
+
+    let functions = file_symbols.functions.len();
+    let structs = file_symbols.structs.len();
+    let enums = file_symbols.enums.len();
+    let traits = file_symbols.traits.len();
+    let consts = file_symbols.consts.len();
+    let statics = file_symbols.statics.len();
+    let total = functions + structs + enums + traits + consts + statics;
+
+    FileSymbolReport {
+        file: file_display,
+        total,
+        functions,
+        structs,
+        enums,
+        traits,
+        consts,
+        statics,
+        symbols: rows,
+    }
 }
 
 pub fn render_symbol_report(report: &SymbolReport, verbose: bool) {
@@ -151,6 +274,86 @@ pub fn render_symbols(rs_files: &[PathBuf], project_path: &Path, verbose: bool) 
 pub fn render_symbols_json(rs_files: &[PathBuf], project_path: &Path) {
     let report = analyze_files(rs_files, project_path);
     println!("{}", serde_json::to_string(&report).unwrap());
+}
+
+pub fn render_symbols_file(rs_files: &[PathBuf], project_path: &Path, file: &Path, verbose: bool) {
+    let symbols = ast_parser::parse_project(rs_files);
+    let report = analyze_symbols_file(&symbols, project_path, file);
+    render_file_symbol_report(&report, verbose);
+}
+
+pub fn render_symbols_file_json(rs_files: &[PathBuf], project_path: &Path, file: &Path) {
+    let symbols = ast_parser::parse_project(rs_files);
+    let report = analyze_symbols_file(&symbols, project_path, file);
+    println!("{}", serde_json::to_string(&report).unwrap());
+}
+
+pub fn render_file_symbol_report(report: &FileSymbolReport, verbose: bool) {
+    render::section_header("Symbols");
+
+    if verbose {
+        render::verbose_block(&[
+            "Counts are Rust AST items found in the selected file.",
+            "Functions includes free functions and impl methods.",
+            "Line spans are available for functions; other symbol kinds show lines -.",
+        ]);
+    }
+
+    println!(
+        "  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}",
+        "total".cyan(),
+        report.total.to_string().bold(),
+        "fn".cyan(),
+        report.functions.to_string().bold(),
+        "struct".cyan(),
+        report.structs.to_string().bold(),
+        "enum".cyan(),
+        report.enums.to_string().bold(),
+        "trait".cyan(),
+        report.traits.to_string().bold(),
+        "const".cyan(),
+        report.consts.to_string().bold(),
+        "static".cyan(),
+        report.statics.to_string().bold(),
+    );
+
+    println!();
+    println!(
+        "  {:<10} {:<48} {}",
+        "kind".bold(),
+        "symbol".bold(),
+        "lines".bold()
+    );
+    for row in &report.symbols {
+        let lines = match (row.line_start, row.line_end) {
+            (Some(start), Some(end)) => format!("{start}-{end}"),
+            _ => "-".to_string(),
+        };
+        println!(
+            "  {:<10} {:<48} {}",
+            file_symbol_kind_label(&row.kind),
+            truncate(&row.symbol, 48),
+            lines,
+        );
+    }
+}
+
+fn file_symbol_kind_label(kind: &FileSymbolKind) -> &'static str {
+    match kind {
+        FileSymbolKind::Fn => "fn",
+        FileSymbolKind::Struct => "struct",
+        FileSymbolKind::Enum => "enum",
+        FileSymbolKind::Trait => "trait",
+        FileSymbolKind::Const => "const",
+        FileSymbolKind::Static => "static",
+    }
+}
+
+fn relative_path_string(project_path: &Path, path: &Path) -> String {
+    path.strip_prefix(project_path)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn strip_prefix<'a>(path: &'a Path, base: &Path) -> &'a Path {

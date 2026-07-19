@@ -1,6 +1,96 @@
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+#[derive(Debug, Clone)]
+pub enum TargetKind {
+    Project,
+    File { file_path: PathBuf },
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalysisTarget {
+    pub project_path: PathBuf,
+    pub kind: TargetKind,
+    pub project_rs_files: Vec<PathBuf>,
+    pub target_rs_files: Vec<PathBuf>,
+}
+
+pub fn selected_file(target: &AnalysisTarget) -> Option<&Path> {
+    match &target.kind {
+        TargetKind::Project => None,
+        TargetKind::File { file_path } => Some(file_path.as_path()),
+    }
+}
+
+pub fn files_for_project(target: &AnalysisTarget) -> &[PathBuf] {
+    &target.project_rs_files
+}
+
+pub fn files_for_target(target: &AnalysisTarget) -> &[PathBuf] {
+    &target.target_rs_files
+}
+
+pub fn resolve_target(path: &Path) -> Result<AnalysisTarget, String> {
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve path '{}': {}", path.display(), e))?;
+
+    if canonical_path.is_dir() {
+        let rs_files = discover_rs_files(&canonical_path)?;
+        return Ok(AnalysisTarget {
+            project_path: canonical_path,
+            kind: TargetKind::Project,
+            project_rs_files: rs_files.clone(),
+            target_rs_files: rs_files,
+        });
+    }
+
+    if canonical_path.is_file() {
+        if canonical_path.extension().is_none_or(|ext| ext != "rs") {
+            return Err(format!(
+                "--path file must be a Rust source file: {}",
+                path.display()
+            ));
+        }
+
+        let mut ancestor = canonical_path.parent();
+        let project_path = loop {
+            match ancestor {
+                Some(dir) if dir.join("Cargo.toml").exists() => break dir.to_path_buf(),
+                Some(dir) => ancestor = dir.parent(),
+                None => {
+                    return Err(format!(
+                        "No Cargo.toml found above '{}'",
+                        canonical_path.display()
+                    ));
+                }
+            }
+        };
+
+        let project_rs_files = discover_rs_files(&project_path)?;
+        if !project_rs_files.contains(&canonical_path) {
+            return Err(format!(
+                "file is not under this crate's src, tests, or benches: {}",
+                canonical_path.display()
+            ));
+        }
+
+        return Ok(AnalysisTarget {
+            project_path,
+            kind: TargetKind::File {
+                file_path: canonical_path.clone(),
+            },
+            project_rs_files,
+            target_rs_files: vec![canonical_path],
+        });
+    }
+
+    Err(format!(
+        "Cannot resolve path '{}': not a file or directory",
+        path.display()
+    ))
+}
+
 /// Discover all `.rs` source files in a Rust project.
 ///
 /// Given a project root directory, this function:

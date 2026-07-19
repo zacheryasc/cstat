@@ -119,25 +119,25 @@ pub(super) fn render_graph_centrality(gs: &graph::GraphSummary) {
     }
 }
 
-/// Render datapath coverage section.
-pub(super) fn render_datapath_coverage(ds: &datapaths::DatapathSummary) {
-    let coverage_color = if ds.coverage_pct > 80.0 {
-        format!("{:.1}%", ds.coverage_pct)
+/// Render static entrypoint reachability section.
+pub(super) fn render_entrypoint_reachability(ds: &datapaths::EntrypointReachabilitySummary) {
+    let reachability_color = if ds.reachable_pct > 80.0 {
+        format!("{:.1}%", ds.reachable_pct)
             .green()
             .bold()
             .to_string()
-    } else if ds.coverage_pct > 50.0 {
-        format!("{:.1}%", ds.coverage_pct)
+    } else if ds.reachable_pct > 50.0 {
+        format!("{:.1}%", ds.reachable_pct)
             .yellow()
             .bold()
             .to_string()
     } else {
-        format!("{:.1}%", ds.coverage_pct).red().bold().to_string()
+        format!("{:.1}%", ds.reachable_pct).red().bold().to_string()
     };
     println!(
         "  {} {} reachable from entry points",
-        "Coverage:".bold(),
-        coverage_color,
+        "Reachability:".bold(),
+        reachability_color,
     );
     println!(
         "  {} reachable, {} cold (of {} total)",

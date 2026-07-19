@@ -55,7 +55,7 @@ pub fn render_summary(rs_files: &[PathBuf], project_path: &Path, verbose: bool) 
     render_connectome_section(&dep_analysis, term_w, verbose);
     render_distributions_section(&func_complexities, verbose);
     render_centrality_section(rs_files, &project_path_canon, verbose);
-    render_datapath_section(rs_files, &project_path_canon, verbose);
+    render_reachability_section(rs_files, &project_path_canon, verbose);
     render_circuits_section(rs_files, &project_path_canon, verbose);
     render_stats_footer(
         &agg_loc,
@@ -385,22 +385,22 @@ fn render_centrality_section(rs_files: &[PathBuf], project_path_canon: &Path, ve
     }
 }
 
-/// Render the datapath coverage section.
-fn render_datapath_section(rs_files: &[PathBuf], project_path_canon: &Path, verbose: bool) {
-    render::section_header("Datapath Coverage");
+/// Render the static entrypoint reachability section.
+fn render_reachability_section(rs_files: &[PathBuf], project_path_canon: &Path, verbose: bool) {
+    render::section_header("Static entrypoint reachability");
 
     if verbose {
         render::verbose_block(&[
-            "Percentage of functions reachable from entry points via call graph traversal.",
-            "Entry points are main() and #[test] functions. Reachability is computed via BFS.",
-            "Coverage = reachable / total. Cold functions = unreachable = dead code candidates.",
+            "Percentage of functions reachable from entry points via static call graph traversal.",
+            "Entry points are main(), #[test] functions, and benchmarks. Reachability is computed via BFS.",
+            "Reachability = reachable / total. Cold functions = unreachable = dead code candidates.",
             "Color: green > 80%, yellow > 50%, red ≤ 50%.",
         ]);
     }
 
-    match datapaths::datapath_summary(rs_files, project_path_canon) {
-        Some(ds) => render_datapath_coverage(&ds),
-        None => println!("  {}", "No datapath data available.".dimmed()),
+    match datapaths::entrypoint_reachability_summary(rs_files, project_path_canon) {
+        Some(ds) => render_entrypoint_reachability(&ds),
+        None => println!("  {}", "No reachability data available.".dimmed()),
     }
 }
 
@@ -513,8 +513,8 @@ struct SummaryGraphJson {
 }
 
 #[derive(Serialize)]
-struct SummaryDatapathJson {
-    coverage_pct: f64,
+struct SummaryReachabilityJson {
+    reachable_pct: f64,
     total_functions: usize,
     reachable_count: usize,
     cold_count: usize,
@@ -535,7 +535,7 @@ struct SummaryJson {
     complexity: Option<SummaryComplexityJson>,
     deps: SummaryDepsJson,
     graph: Option<SummaryGraphJson>,
-    datapaths: Option<SummaryDatapathJson>,
+    reachability: Option<SummaryReachabilityJson>,
     circuits: Option<SummaryCircuitsJson>,
 }
 
@@ -610,12 +610,14 @@ pub fn render_summary_json(rs_files: &[PathBuf], project_path: &Path) {
             top_clustered: gs.top_clustered,
         });
 
-    let datapaths_json =
-        datapaths::datapath_summary(rs_files, &project_path_canon).map(|ds| SummaryDatapathJson {
-            coverage_pct: ds.coverage_pct,
-            total_functions: ds.total_functions,
-            reachable_count: ds.reachable_count,
-            cold_count: ds.cold_count,
+    let reachability_json =
+        datapaths::entrypoint_reachability_summary(rs_files, &project_path_canon).map(|ds| {
+            SummaryReachabilityJson {
+                reachable_pct: ds.reachable_pct,
+                total_functions: ds.total_functions,
+                reachable_count: ds.reachable_count,
+                cold_count: ds.cold_count,
+            }
         });
 
     let circuits_json =
@@ -632,7 +634,7 @@ pub fn render_summary_json(rs_files: &[PathBuf], project_path: &Path) {
         complexity: complexity_json,
         deps: deps_json,
         graph: graph_json,
-        datapaths: datapaths_json,
+        reachability: reachability_json,
         circuits: circuits_json,
     };
 

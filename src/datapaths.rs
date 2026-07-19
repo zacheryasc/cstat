@@ -5,7 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::flow::{self, build_call_graph, CallGraph, EntryPointKind};
-use crate::render;
+use crate::{ast_parser, file_metrics, render};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TestReachabilityEntry {
@@ -41,6 +41,37 @@ pub struct TestReachabilityAnalysis {
     pub edge_reachability_counts: Vec<EdgeReachabilityCount>,
     pub unreachable_functions: Vec<String>,
     pub analysis_note: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileStaticReachabilityEntry {
+    pub entry: String,
+    pub kind: String,
+    pub reachable_functions: usize,
+    pub unique_call_steps: usize,
+    pub max_call_depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileStaticReachabilityEdge {
+    pub caller: String,
+    pub callee: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileStaticReachabilityReport {
+    pub file: String,
+    pub test_benchmark_entry_count: usize,
+    pub production_function_count: usize,
+    pub reachable_function_count: usize,
+    pub unreachable_function_count: usize,
+    pub local_edge_count: usize,
+    pub reachable_local_edge_count: usize,
+    pub entries: Vec<FileStaticReachabilityEntry>,
+    pub reachable_functions: Vec<String>,
+    pub unreachable_functions: Vec<String>,
+    pub reachable_edges: Vec<FileStaticReachabilityEdge>,
+    pub wrapper_entrypoints: Vec<String>,
 }
 
 pub fn analyze_test_reachability(
@@ -149,6 +180,126 @@ pub fn analyze_graph_test_reachability(graph: &CallGraph) -> TestReachabilityAna
         edge_reachability_counts,
         unreachable_functions,
         analysis_note: "Static test/benchmark reachability. Counts are how many test or benchmark entry roots can reach a function/edge, not runtime coverage or hit counts.".to_string(),
+    }
+}
+
+pub fn analyze_file_static_reachability(
+    graph: &CallGraph,
+    file_functions: &file_metrics::FileFunctionIndex,
+    file_display_path: &str,
+) -> FileStaticReachabilityReport {
+    let selected: HashSet<String> = file_functions
+        .functions
+        .iter()
+        .map(|function| function.graph_name.clone())
+        .collect();
+    let production: HashSet<String> = file_functions
+        .functions
+        .iter()
+        .filter(|function| {
+            !function.is_test
+                && !function.is_bench
+                && !function.is_test_support
+                && !function.is_binary_wrapper_main
+        })
+        .map(|function| function.graph_name.clone())
+        .collect();
+    let mut wrapper_entrypoints: Vec<String> = file_functions
+        .functions
+        .iter()
+        .filter(|function| function.is_binary_wrapper_main)
+        .map(|function| function.display_name.clone())
+        .collect();
+    wrapper_entrypoints.sort();
+
+    let mut roots = flow::entry_points_by_kind(graph, EntryPointKind::Test);
+    roots.extend(flow::entry_points_by_kind(graph, EntryPointKind::Bench));
+    roots.sort();
+    roots.dedup();
+
+    let mut reachable_functions_set: HashSet<String> = HashSet::new();
+    let mut reachable_edges_set: HashSet<(String, String)> = HashSet::new();
+    let mut entries = Vec::new();
+
+    for root in &roots {
+        let (reachable, edges) = reachable_subgraph(graph, root);
+        let root_reachable_functions = reachable
+            .iter()
+            .filter(|function| production.contains(*function))
+            .count();
+        let root_reachable_edges = edges
+            .iter()
+            .filter(|(caller, callee)| selected.contains(caller) && selected.contains(callee))
+            .count();
+
+        reachable_functions_set.extend(
+            reachable
+                .iter()
+                .filter(|function| production.contains(*function))
+                .cloned(),
+        );
+        reachable_edges_set.extend(
+            edges
+                .iter()
+                .filter(|(caller, callee)| selected.contains(caller) && selected.contains(callee))
+                .cloned(),
+        );
+
+        let kind = graph
+            .entry_point_kinds
+            .get(root)
+            .map(|kind| kind.as_str().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        entries.push(FileStaticReachabilityEntry {
+            entry: root.clone(),
+            kind,
+            reachable_functions: root_reachable_functions,
+            unique_call_steps: root_reachable_edges,
+            max_call_depth: max_depth_from(graph, root, &mut HashSet::new()),
+        });
+    }
+
+    entries.sort_by(|a, b| a.entry.cmp(&b.entry));
+
+    let mut reachable_functions: Vec<String> = reachable_functions_set.into_iter().collect();
+    reachable_functions.sort();
+    let mut unreachable_functions: Vec<String> = production
+        .iter()
+        .filter(|function| !reachable_functions.contains(function))
+        .cloned()
+        .collect();
+    unreachable_functions.sort();
+
+    let local_edge_count = graph
+        .adjacency
+        .iter()
+        .map(|(caller, callees)| {
+            callees
+                .iter()
+                .filter(|callee| selected.contains(caller) && selected.contains(*callee))
+                .count()
+        })
+        .sum();
+
+    let mut reachable_edges: Vec<FileStaticReachabilityEdge> = reachable_edges_set
+        .into_iter()
+        .map(|(caller, callee)| FileStaticReachabilityEdge { caller, callee })
+        .collect();
+    reachable_edges.sort_by(|a, b| a.caller.cmp(&b.caller).then(a.callee.cmp(&b.callee)));
+
+    FileStaticReachabilityReport {
+        file: file_display_path.to_string(),
+        test_benchmark_entry_count: entries.len(),
+        production_function_count: production.len(),
+        reachable_function_count: reachable_functions.len(),
+        unreachable_function_count: unreachable_functions.len(),
+        local_edge_count,
+        reachable_local_edge_count: reachable_edges.len(),
+        entries,
+        reachable_functions,
+        unreachable_functions,
+        reachable_edges,
+        wrapper_entrypoints,
     }
 }
 
@@ -294,6 +445,147 @@ pub fn render_test_reachability(rs_files: &[PathBuf], project_path: &Path, verbo
 pub fn render_test_reachability_json(rs_files: &[PathBuf], project_path: &Path) {
     let report = analyze_test_reachability(rs_files, project_path);
     println!("{}", serde_json::to_string(&report).unwrap());
+}
+
+pub fn render_test_reachability_file(
+    rs_files: &[PathBuf],
+    project_path: &Path,
+    file: &Path,
+    verbose: bool,
+) {
+    let report = analyze_file_static_reachability_from_files(rs_files, project_path, file);
+    render_file_static_reachability_report(&report, verbose);
+}
+
+pub fn render_test_reachability_file_json(rs_files: &[PathBuf], project_path: &Path, file: &Path) {
+    let report = analyze_file_static_reachability_from_files(rs_files, project_path, file);
+    println!("{}", serde_json::to_string(&report).unwrap());
+}
+
+pub fn analyze_file_static_reachability_from_files(
+    rs_files: &[PathBuf],
+    project_path: &Path,
+    file: &Path,
+) -> FileStaticReachabilityReport {
+    let symbols = ast_parser::parse_project(rs_files);
+    let graph = build_call_graph(rs_files, project_path);
+    let file_functions =
+        file_metrics::selected_file_functions(&symbols, &graph, project_path, file);
+    let file_display_path = relative_path_string(project_path, file);
+    analyze_file_static_reachability(&graph, &file_functions, &file_display_path)
+}
+
+pub fn render_file_static_reachability_report(
+    report: &FileStaticReachabilityReport,
+    verbose: bool,
+) {
+    render::section_header("Static test/benchmark reachability");
+
+    if verbose {
+        render::verbose_block(&[
+            "Roots are tests and benchmarks discovered anywhere in the project.",
+            "Reachability is computed from the static call graph; it is not runtime coverage.",
+            "Production counts exclude tests, test-support helpers, benches, and selected binary wrapper main().",
+        ]);
+    }
+
+    let pct = if report.production_function_count == 0 {
+        0.0
+    } else {
+        report.reachable_function_count as f64 / report.production_function_count as f64 * 100.0
+    };
+    println!(
+        "  {} {}  {} {} / {} ({:.1}%)  {} {} / {}",
+        "test/bench roots".cyan(),
+        report.test_benchmark_entry_count.to_string().bold(),
+        "functions reachable".cyan(),
+        report.reachable_function_count.to_string().bold(),
+        report.production_function_count,
+        pct,
+        "local edges reached".cyan(),
+        report.reachable_local_edge_count.to_string().bold(),
+        report.local_edge_count,
+    );
+
+    if !report.wrapper_entrypoints.is_empty() {
+        println!(
+            "  {} {}",
+            "wrapper entrypoints:".cyan(),
+            report.wrapper_entrypoints.join(", ")
+        );
+    }
+
+    let visible_entries: Vec<&FileStaticReachabilityEntry> = report
+        .entries
+        .iter()
+        .filter(|entry| entry.reachable_functions > 0 || entry.unique_call_steps > 0)
+        .collect();
+
+    println!();
+    println!(
+        "  {:<48} {:<7} {:>9} {:>7} {:>8}",
+        "entry root".bold(),
+        "kind".bold(),
+        "functions".bold(),
+        "steps".bold(),
+        "depth".bold(),
+    );
+    if report.entries.is_empty() {
+        println!("  {}", "No project test or benchmark roots found.".yellow());
+    } else if visible_entries.is_empty() {
+        println!(
+            "  {}",
+            "No project test or benchmark roots reach selected production functions.".yellow()
+        );
+    } else {
+        for entry in visible_entries {
+            println!(
+                "  {:<48} {:<7} {:>9} {:>7} {:>8}",
+                truncate(&entry.entry, 48),
+                entry.kind,
+                entry.reachable_functions,
+                entry.unique_call_steps,
+                entry.max_call_depth,
+            );
+        }
+    }
+
+    println!();
+    println!("  {}", "reachable functions:".bold());
+    if report.reachable_functions.is_empty() {
+        println!("  {}", "<none>".dimmed());
+    } else {
+        for function in &report.reachable_functions {
+            println!("  {} {}", "•".green(), function);
+        }
+    }
+
+    println!();
+    println!("  {}", "not statically reachable:".bold().yellow());
+    if report.unreachable_functions.is_empty() {
+        println!("  {}", "<none>".dimmed());
+    } else {
+        for function in &report.unreachable_functions {
+            println!("  {} {}", "•".yellow(), function);
+        }
+    }
+
+    println!();
+    println!("  {}", "reachable local edges:".bold());
+    if report.reachable_edges.is_empty() {
+        println!("  {}", "<none>".dimmed());
+    } else {
+        for edge in &report.reachable_edges {
+            println!("  {} {} -> {}", "•".green(), edge.caller, edge.callee);
+        }
+    }
+}
+
+fn relative_path_string(project_path: &Path, path: &Path) -> String {
+    path.strip_prefix(project_path)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -691,10 +983,10 @@ fn render_cold_functions(graph: &CallGraph, visit_counts: &HashMap<String, usize
     println!();
 }
 
-/// Compact summary data for embedding in the dashboard.
-pub struct DatapathSummary {
-    /// Percentage of functions reachable from entry points.
-    pub coverage_pct: f64,
+/// Compact static entrypoint-reachability data for embedding in the dashboard.
+pub struct EntrypointReachabilitySummary {
+    /// Percentage of functions statically reachable from entry points.
+    pub reachable_pct: f64,
     /// Total function count.
     pub total_functions: usize,
     /// Number of reachable functions.
@@ -703,8 +995,11 @@ pub struct DatapathSummary {
     pub cold_count: usize,
 }
 
-/// Compute compact datapath coverage for dashboard use.
-pub fn datapath_summary(rs_files: &[PathBuf], project_path: &Path) -> Option<DatapathSummary> {
+/// Compute compact static entrypoint reachability for dashboard use.
+pub fn entrypoint_reachability_summary(
+    rs_files: &[PathBuf],
+    project_path: &Path,
+) -> Option<EntrypointReachabilitySummary> {
     let graph = build_call_graph(rs_files, project_path);
     if graph.functions.is_empty() {
         return None;
@@ -713,10 +1008,10 @@ pub fn datapath_summary(rs_files: &[PathBuf], project_path: &Path) -> Option<Dat
     let reachable = reachable_from_entries(&graph);
     let reachable_count = reachable.len();
     let cold_count = total_functions.saturating_sub(reachable_count);
-    let coverage_pct = reachable_count as f64 / total_functions.max(1) as f64 * 100.0;
+    let reachable_pct = reachable_count as f64 / total_functions.max(1) as f64 * 100.0;
 
-    Some(DatapathSummary {
-        coverage_pct,
+    Some(EntrypointReachabilitySummary {
+        reachable_pct,
         total_functions,
         reachable_count,
         cold_count,

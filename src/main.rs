@@ -1,7 +1,9 @@
 mod ast_parser;
 mod call_trace;
 mod circuits;
+mod cluster;
 mod complexity;
+mod coverage;
 mod datapaths;
 mod dead_code;
 mod deps;
@@ -9,6 +11,8 @@ mod diagnostics;
 mod discovery;
 mod dist;
 mod dump;
+mod file_metrics;
+mod file_summary;
 mod flow;
 mod graph;
 mod guide;
@@ -78,6 +82,14 @@ enum Commands {
         #[arg(long, name = "PATH::FUNCTION")]
         entry: Option<String>,
     },
+    /// Dynamic line and branch coverage from Rust source-based coverage data.
+    Coverage {
+        /// Parse an existing llvm-cov export JSON from CSTAT_LLVM_COV_EXPORT_JSON instead of running tests.
+        #[arg(long)]
+        no_run: bool,
+    },
+    /// Value-cluster transcript from AST def-use structure.
+    Cluster,
     /// Opt-in legacy and exploratory analyses
     Advanced {
         #[command(subcommand)]
@@ -150,10 +162,8 @@ fn main() {
     }
 
     let verbose = cli.verbose;
-    let project_path = &cli.path;
-
-    let rs_files = match discovery::discover_rs_files(project_path) {
-        Ok(files) => files,
+    let target = match discovery::resolve_target(&cli.path) {
+        Ok(target) => target,
         Err(e) => {
             if json {
                 let err = serde_json::json!({"error": format!("{}", e)});
@@ -164,12 +174,130 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let project_path = &target.project_path;
+    let rs_files = discovery::files_for_project(&target);
 
     let command = cli.command.unwrap_or(Commands::Summary);
 
-    let project_path = project_path
-        .canonicalize()
-        .unwrap_or_else(|_| project_path.to_path_buf());
+    if let Some(file) = discovery::selected_file(&target) {
+        let project_rs_files = discovery::files_for_project(&target);
+        let target_rs_files = discovery::files_for_target(&target);
+        match command {
+            Commands::Summary | Commands::Report => {
+                if json {
+                    file_summary::render_file_summary_json(project_rs_files, project_path, file);
+                } else {
+                    file_summary::render_file_summary(
+                        project_rs_files,
+                        project_path,
+                        file,
+                        verbose,
+                    );
+                }
+            }
+            Commands::Loc { .. } => {
+                if json {
+                    loc::render_loc_file_json(project_rs_files, project_path, file);
+                } else {
+                    loc::render_loc_file(project_rs_files, project_path, file, verbose);
+                }
+            }
+            Commands::Symbols => {
+                if json {
+                    symbols::render_symbols_file_json(project_rs_files, project_path, file);
+                } else {
+                    symbols::render_symbols_file(project_rs_files, project_path, file, verbose);
+                }
+            }
+            Commands::Complexity => {
+                complexity::run(target_rs_files, project_path, json, verbose);
+            }
+            Commands::Cluster => {
+                if json {
+                    cluster::render_cluster_file_json(project_rs_files, project_path, file);
+                } else {
+                    cluster::render_cluster_file(project_rs_files, project_path, file, verbose);
+                }
+            }
+            Commands::Deps { .. } => {
+                if json {
+                    deps::render_deps_file_json(project_rs_files, project_path, file);
+                } else {
+                    deps::render_deps_file(project_rs_files, project_path, file, verbose);
+                }
+            }
+            Commands::DeadCode => {
+                if json {
+                    dead_code::render_dead_code_file_json(project_rs_files, project_path, file);
+                } else {
+                    dead_code::render_dead_code_file(project_rs_files, project_path, file, verbose);
+                }
+            }
+            Commands::TestReachability => {
+                if json {
+                    datapaths::render_test_reachability_file_json(
+                        project_rs_files,
+                        project_path,
+                        file,
+                    );
+                } else {
+                    datapaths::render_test_reachability_file(
+                        project_rs_files,
+                        project_path,
+                        file,
+                        verbose,
+                    );
+                }
+            }
+            Commands::CallTrace { entry } => {
+                if let Err(message) = call_trace::run_file(
+                    project_rs_files,
+                    project_path,
+                    file,
+                    entry.as_deref(),
+                    json,
+                    verbose,
+                ) {
+                    if json {
+                        let err = serde_json::json!({"error": message});
+                        println!("{}", serde_json::to_string(&err).unwrap());
+                    } else {
+                        eprintln!("Error: {}", message);
+                    }
+                    std::process::exit(1);
+                }
+            }
+            Commands::Coverage { no_run } => {
+                if let Err(message) = coverage::render_coverage(
+                    project_rs_files,
+                    project_path,
+                    Some(file),
+                    no_run,
+                    json,
+                ) {
+                    if json {
+                        let err = serde_json::json!({"error": message});
+                        println!("{}", serde_json::to_string(&err).unwrap());
+                    } else {
+                        eprintln!("Error: {}", message);
+                    }
+                    std::process::exit(1);
+                }
+            }
+            Commands::Advanced { .. } => {
+                let message =
+                    "advanced commands require a project directory; pass --path <crate-dir>";
+                if json {
+                    let err = serde_json::json!({"error": message});
+                    println!("{}", serde_json::to_string(&err).unwrap());
+                } else {
+                    eprintln!("Error: {}", message);
+                }
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     match command {
         Commands::Summary | Commands::Report => {
@@ -196,6 +324,9 @@ fn main() {
         Commands::Complexity => {
             complexity::run(&rs_files, &project_path, json, verbose);
         }
+        Commands::Cluster => {
+            cluster::render_cluster(&rs_files, &project_path, json, verbose);
+        }
         Commands::Deps { top } => {
             if json {
                 deps::render_deps_json(&rs_files, &project_path);
@@ -220,6 +351,19 @@ fn main() {
         Commands::CallTrace { entry } => {
             if let Err(message) =
                 call_trace::run(&rs_files, &project_path, entry.as_deref(), json, verbose)
+            {
+                if json {
+                    let err = serde_json::json!({"error": message});
+                    println!("{}", serde_json::to_string(&err).unwrap());
+                } else {
+                    eprintln!("Error: {}", message);
+                }
+                std::process::exit(1);
+            }
+        }
+        Commands::Coverage { no_run } => {
+            if let Err(message) =
+                coverage::render_coverage(&rs_files, &project_path, None, no_run, json)
             {
                 if json {
                     let err = serde_json::json!({"error": message});

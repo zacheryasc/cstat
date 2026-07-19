@@ -2,6 +2,7 @@ mod render;
 
 pub use render::{render_deps, render_deps_json};
 
+use colored::Colorize;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,29 @@ pub struct DepAnalysis {
     pub in_degree: HashMap<String, usize>,
     pub out_degree: HashMap<String, usize>,
     pub coupling_pairs: Vec<(String, String, usize)>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileDependency {
+    pub raw: String,
+    pub resolved_module: Option<String>,
+    pub kind: FileDependencyKind,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDependencyKind {
+    Internal,
+    External,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileDependencyReport {
+    pub file: String,
+    pub module: String,
+    pub imports: usize,
+    pub internal: Vec<FileDependency>,
+    pub external: Vec<FileDependency>,
 }
 
 /// Extract use targets from a Rust source file.
@@ -211,6 +235,119 @@ pub fn analyze_deps(rs_files: &[PathBuf], project_path: &Path) -> DepAnalysis {
         out_degree,
         coupling_pairs,
     }
+}
+
+pub fn analyze_file_deps(
+    rs_files: &[PathBuf],
+    project_path: &Path,
+    file: &Path,
+) -> FileDependencyReport {
+    let mut module_names: Vec<String> = rs_files
+        .iter()
+        .map(|path| crate_render::module_name_from_path(path, project_path))
+        .collect();
+    module_names.sort();
+    module_names.dedup();
+    let known_modules: HashSet<String> = module_names.iter().cloned().collect();
+
+    let module = crate_render::module_name_from_path(file, project_path);
+    let file_display = relative_path_string(project_path, file);
+    let source = std::fs::read_to_string(file).unwrap_or_default();
+    let mut use_targets = extract_use_targets(&source);
+    use_targets.sort();
+    use_targets.dedup();
+
+    let mut internal = Vec::new();
+    let mut external = Vec::new();
+    for raw in use_targets {
+        if let Some(resolved_module) = resolve_to_module(&raw, &known_modules) {
+            internal.push(FileDependency {
+                raw,
+                resolved_module: Some(resolved_module),
+                kind: FileDependencyKind::Internal,
+            });
+        } else {
+            external.push(FileDependency {
+                raw,
+                resolved_module: None,
+                kind: FileDependencyKind::External,
+            });
+        }
+    }
+
+    FileDependencyReport {
+        file: file_display,
+        module,
+        imports: internal.len() + external.len(),
+        internal,
+        external,
+    }
+}
+
+pub fn render_deps_file(rs_files: &[PathBuf], project_path: &Path, file: &Path, verbose: bool) {
+    let report = analyze_file_deps(rs_files, project_path, file);
+    render_file_dependency_report(&report, verbose);
+}
+
+pub fn render_deps_file_json(rs_files: &[PathBuf], project_path: &Path, file: &Path) {
+    let report = analyze_file_deps(rs_files, project_path, file);
+    println!("{}", serde_json::to_string(&report).unwrap());
+}
+
+pub fn render_file_dependency_report(report: &FileDependencyReport, verbose: bool) {
+    crate_render::section_header("Dependencies");
+
+    if verbose {
+        crate_render::verbose_block(&[
+            "Imports are raw use/mod targets parsed from the selected file.",
+            "Internal imports resolve to known modules in the discovered crate files.",
+            "External imports do not resolve to a known local module.",
+        ]);
+    }
+
+    println!(
+        "  {} {}  {} {}  {} {}  {} {}",
+        "module".cyan(),
+        report.module.bold(),
+        "imports".cyan(),
+        report.imports.to_string().bold(),
+        "internal".cyan(),
+        report.internal.len().to_string().bold(),
+        "external".cyan(),
+        report.external.len().to_string().bold(),
+    );
+
+    println!();
+    println!("  {}", "internal imports:".bold());
+    if report.internal.is_empty() {
+        println!("  {}", "<none>".dimmed());
+    } else {
+        for dependency in &report.internal {
+            println!(
+                "  {} {} -> {}",
+                "•".green(),
+                dependency.raw,
+                dependency.resolved_module.as_deref().unwrap_or("-")
+            );
+        }
+    }
+
+    println!();
+    println!("  {}", "external imports:".bold());
+    if report.external.is_empty() {
+        println!("  {}", "<none>".dimmed());
+    } else {
+        for dependency in &report.external {
+            println!("  {} {}", "•".yellow(), dependency.raw);
+        }
+    }
+}
+
+fn relative_path_string(project_path: &Path, path: &Path) -> String {
+    path.strip_prefix(project_path)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Compute call cohesion: fraction of functions calling another function in the same module.
