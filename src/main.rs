@@ -91,7 +91,7 @@ Use --explain to print this usage and JSON field contract without running analys
         #[arg(long)]
         explain: bool,
     },
-    /// Symbol counts by kind and file
+    /// Rust AST symbol counts by kind, including trait impl blocks
     Symbols,
     /// Per-function and per-file complexity rankings
     Complexity,

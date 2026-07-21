@@ -20,7 +20,8 @@ report. The JSON contains:
 
 - `line_counts`: total code lines, physical lines, and per-file counts.
 - `symbols`: total and per-file counts for functions, structs, enums, traits,
-  and impl blocks.
+  `trait_impls`, consts, statics, and parse-error state. `trait_impls` means
+  `impl Trait for Type` blocks only, not inherent `impl Type` blocks.
 - `dependencies`: module list, module interdependency matrix, edge count, and
   fan-in/fan-out degrees.
 - `dead_code`: functions not statically reachable from main, tests, or
@@ -40,7 +41,8 @@ Each accepts `--json` for structured output.
 - `cstat loc --json --path .` — project size-shape data.
 - `cstat loc --json --path src/lib.rs` — selected-file projected static line
   reachability.
-- `cstat symbols --json --path .` — symbol totals by kind and per file.
+- `cstat symbols --json --path .` — symbol totals by kind and per file; pass a
+  Rust source file to `--path` for selected-file rows and line spans.
 - `cstat deps --json --path .` — dependency edges, coupling, fan-in/fan-out,
   and cohesion.
 - `cstat dead-code --json --path .` — static cold-function candidates.
@@ -89,5 +91,10 @@ Use these only when the focused report points to a question they answer:
 - For exact `loc` `code_lines` rules and JSON fields, run
   `cstat loc --explain` or `cstat loc --explain --json`; that command is the
   canonical contract.
+- Symbol counts come from `syn` Rust AST parsing. They are not semantic name
+  resolution, rustc integration, macro expansion, or proof of public API usage.
+  Parse errors are reported instead of ignored; selected-file mode is used when
+  `--path` points at a Rust source file under a crate's source, test, or bench
+  root.
 - Prefer targeted reductions: remove dead code, split large files, move symbols
   across modules, then reduce per-function complexity.
