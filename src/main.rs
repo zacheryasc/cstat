@@ -33,7 +33,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Path to the Rust project directory (defaults to current directory)
+    /// Rust project directory or Rust source file to analyze (defaults to current directory)
     #[arg(long, default_value = ".", global = true)]
     path: PathBuf,
 
@@ -56,11 +56,40 @@ enum Commands {
     Summary,
     /// Alias for the focused module metrics report
     Report,
-    /// Lines-of-code analysis with bar charts
+    #[command(
+        about = "Lines-of-code size-shape analysis",
+        long_about = r#"Lines-of-code size-shape analysis for Rust source.
+
+Project mode:
+  cstat loc --path .
+  cstat loc --path . --json
+
+Selected-file mode:
+  cstat loc --path src/lib.rs
+  cstat loc --path src/lib.rs --json
+
+Explain mode:
+  cstat loc --explain
+  cstat loc --explain --json
+
+Project mode reports total physical lines, code_lines, aggregate stats, per-file ranking, and directory breakdown for discovered Rust files. Selected-file mode reports projected static reachable/unreachable production line spans for one Rust source file.
+
+code_lines is a static textual classification: blank lines are excluded, // comment-only lines are excluded, and block-comment-only regions are excluded using simple /* ... */ state tracking. It is not semantic Rust parsing.
+
+Project JSON fields: cstat_version, files[{path,total_lines,code_lines}], aggregate{total_files,total_loc,mean,std_dev,median,min,max}, directory_breakdown[{directory,code_lines}].
+Selected-file JSON fields: file, total_lines, code_lines, projected_reachable_lines, projected_unreachable_lines, reachable_spans[{function,line_start,line_end}], unreachable_spans[{function,line_start,line_end}].
+
+Use --explain to print this usage and JSON field contract without running analysis. --path, --top, and -v are ignored by --explain.
+
+--top only limits the project-mode per-file ranking (ignored for selected-file and --explain modes)."#
+    )]
     Loc {
-        /// Show only the top N files
+        /// Show only the top N files in project mode (ignored for selected-file and --explain modes)
         #[arg(long)]
         top: Option<usize>,
+        /// Print the loc usage and JSON field contract without running analysis
+        #[arg(long)]
+        explain: bool,
     },
     /// Symbol counts by kind and file
     Symbols,
@@ -162,6 +191,12 @@ fn main() {
     }
 
     let verbose = cli.verbose;
+    let command = cli.command.unwrap_or(Commands::Summary);
+
+    if let Commands::Loc { explain: true, .. } = &command {
+        loc::render_loc_explain(json);
+        return;
+    }
     let target = match discovery::resolve_target(&cli.path) {
         Ok(target) => target,
         Err(e) => {
@@ -176,8 +211,6 @@ fn main() {
     };
     let project_path = &target.project_path;
     let rs_files = discovery::files_for_project(&target);
-
-    let command = cli.command.unwrap_or(Commands::Summary);
 
     if let Some(file) = discovery::selected_file(&target) {
         let project_rs_files = discovery::files_for_project(&target);
@@ -307,7 +340,7 @@ fn main() {
                 report::render_report(&rs_files, &project_path, verbose);
             }
         }
-        Commands::Loc { top } => {
+        Commands::Loc { top, .. } => {
             if json {
                 loc::render_loc_json(&rs_files, &project_path);
             } else {
