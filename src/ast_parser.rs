@@ -33,6 +33,8 @@ pub struct StructInfo {
     pub field_count: usize,
     pub derive_count: usize,
     pub generic_param_count: usize,
+    pub line_start: usize,
+    pub line_end: usize,
 }
 
 /// Extracted information about an enum.
@@ -44,6 +46,8 @@ pub struct EnumInfo {
     pub variant_count: usize,
     pub derive_count: usize,
     pub generic_param_count: usize,
+    pub line_start: usize,
+    pub line_end: usize,
 }
 
 /// Extracted information about a trait.
@@ -54,6 +58,8 @@ pub struct TraitInfo {
     pub file: PathBuf,
     pub method_count: usize,
     pub generic_param_count: usize,
+    pub line_start: usize,
+    pub line_end: usize,
 }
 
 /// Extracted information about a const item.
@@ -62,6 +68,8 @@ pub struct TraitInfo {
 pub struct ConstInfo {
     pub name: String,
     pub file: PathBuf,
+    pub line_start: usize,
+    pub line_end: usize,
 }
 
 /// Extracted information about a static item.
@@ -70,6 +78,8 @@ pub struct ConstInfo {
 pub struct StaticInfo {
     pub name: String,
     pub file: PathBuf,
+    pub line_start: usize,
+    pub line_end: usize,
 }
 
 /// Extracted information about an impl block.
@@ -78,6 +88,8 @@ pub struct StaticInfo {
 pub struct ImplInfo {
     pub target_type: String,
     pub file: PathBuf,
+    pub line_start: usize,
+    pub line_end: usize,
     pub method_count: usize,
     pub trait_name: Option<String>,
 }
@@ -218,6 +230,15 @@ impl SymbolExtractor {
                     syn::Fields::Unnamed(f) => f.unnamed.len(),
                     syn::Fields::Unit => 0,
                 };
+                let line_start = s.struct_token.span.start().line;
+                let line_end = match &s.fields {
+                    syn::Fields::Named(fields) => fields.brace_token.span.close().end().line,
+                    syn::Fields::Unnamed(fields) => fields.paren_token.span.close().end().line,
+                    syn::Fields::Unit => s
+                        .semi_token
+                        .as_ref()
+                        .map_or(line_start, |semi| semi.span.end().line),
+                };
                 let derive_count = count_derives(&s.attrs);
                 let generic_param_count = s.generics.params.len();
                 self.structs.push(StructInfo {
@@ -226,6 +247,8 @@ impl SymbolExtractor {
                     field_count,
                     derive_count,
                     generic_param_count,
+                    line_start,
+                    line_end,
                 });
             }
             Item::Enum(e) => {
@@ -237,6 +260,8 @@ impl SymbolExtractor {
                     variant_count: e.variants.len(),
                     derive_count,
                     generic_param_count,
+                    line_start: e.enum_token.span.start().line,
+                    line_end: e.brace_token.span.close().end().line,
                 });
             }
             Item::Trait(t) => {
@@ -251,18 +276,24 @@ impl SymbolExtractor {
                     file: self.file_path.clone(),
                     method_count,
                     generic_param_count,
+                    line_start: t.trait_token.span.start().line,
+                    line_end: t.brace_token.span.close().end().line,
                 });
             }
             Item::Const(c) => {
                 self.consts.push(ConstInfo {
                     name: self.qualify_name(&c.ident.to_string()),
                     file: self.file_path.clone(),
+                    line_start: c.const_token.span.start().line,
+                    line_end: c.semi_token.span.end().line,
                 });
             }
             Item::Static(s) => {
                 self.statics.push(StaticInfo {
                     name: self.qualify_name(&s.ident.to_string()),
                     file: self.file_path.clone(),
+                    line_start: s.static_token.span.start().line,
+                    line_end: s.semi_token.span.end().line,
                 });
             }
             Item::Impl(imp) => {
@@ -274,6 +305,8 @@ impl SymbolExtractor {
                         .collect::<Vec<_>>()
                         .join("::")
                 });
+                let line_start = imp.impl_token.span.start().line;
+                let line_end = imp.brace_token.span.close().end().line;
                 let mut method_count = 0;
                 for impl_item in &imp.items {
                     if let ImplItem::Fn(method) = impl_item {
@@ -294,6 +327,8 @@ impl SymbolExtractor {
                 self.impls.push(ImplInfo {
                     target_type,
                     file: self.file_path.clone(),
+                    line_start,
+                    line_end,
                     method_count,
                     trait_name,
                 });

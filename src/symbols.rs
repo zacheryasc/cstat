@@ -12,7 +12,9 @@ pub struct SymbolTotals {
     pub structs: usize,
     pub enums: usize,
     pub traits: usize,
-    pub impls: usize,
+    pub trait_impls: usize,
+    pub consts: usize,
+    pub statics: usize,
     pub parse_error_files: usize,
 }
 
@@ -24,7 +26,9 @@ pub struct FileSymbolCounts {
     pub structs: usize,
     pub enums: usize,
     pub traits: usize,
-    pub impls: usize,
+    pub trait_impls: usize,
+    pub consts: usize,
+    pub statics: usize,
     pub parse_error: bool,
 }
 
@@ -41,6 +45,7 @@ pub enum FileSymbolKind {
     Struct,
     Enum,
     Trait,
+    TraitImpl,
     Const,
     Static,
 }
@@ -61,8 +66,10 @@ pub struct FileSymbolReport {
     pub structs: usize,
     pub enums: usize,
     pub traits: usize,
+    pub trait_impls: usize,
     pub consts: usize,
     pub statics: usize,
+    pub parse_error: bool,
     pub symbols: Vec<FileSymbolRow>,
 }
 
@@ -75,8 +82,10 @@ pub fn analyze_symbols(symbols: &ProjectSymbols, project_path: &Path) -> SymbolR
             let structs = file.structs.len();
             let enums = file.enums.len();
             let traits = file.traits.len();
-            let impls = file.impls.len();
-            let total = functions + structs + enums + traits + impls;
+            let trait_impls = file.impls.iter().filter(|i| i.trait_name.is_some()).count();
+            let consts = file.consts.len();
+            let statics = file.statics.len();
+            let total = functions + structs + enums + traits + trait_impls + consts + statics;
 
             FileSymbolCounts {
                 path: strip_prefix(&file.path, project_path).display().to_string(),
@@ -85,7 +94,9 @@ pub fn analyze_symbols(symbols: &ProjectSymbols, project_path: &Path) -> SymbolR
                 structs,
                 enums,
                 traits,
-                impls,
+                trait_impls,
+                consts,
+                statics,
                 parse_error: file.parse_error,
             }
         })
@@ -99,7 +110,9 @@ pub fn analyze_symbols(symbols: &ProjectSymbols, project_path: &Path) -> SymbolR
         acc.structs += file.structs;
         acc.enums += file.enums;
         acc.traits += file.traits;
-        acc.impls += file.impls;
+        acc.trait_impls += file.trait_impls;
+        acc.consts += file.consts;
+        acc.statics += file.statics;
         if file.parse_error {
             acc.parse_error_files += 1;
         }
@@ -128,8 +141,10 @@ pub fn analyze_symbols_file(
             structs: 0,
             enums: 0,
             traits: 0,
+            trait_impls: 0,
             consts: 0,
             statics: 0,
+            parse_error: false,
             symbols: Vec::new(),
         };
     };
@@ -147,40 +162,50 @@ pub fn analyze_symbols_file(
         rows.push(FileSymbolRow {
             kind: FileSymbolKind::Struct,
             symbol: item.name.clone(),
-            line_start: None,
-            line_end: None,
+            line_start: Some(item.line_start),
+            line_end: Some(item.line_end),
         });
     }
     for item in &file_symbols.enums {
         rows.push(FileSymbolRow {
             kind: FileSymbolKind::Enum,
             symbol: item.name.clone(),
-            line_start: None,
-            line_end: None,
+            line_start: Some(item.line_start),
+            line_end: Some(item.line_end),
         });
     }
     for item in &file_symbols.traits {
         rows.push(FileSymbolRow {
             kind: FileSymbolKind::Trait,
             symbol: item.name.clone(),
-            line_start: None,
-            line_end: None,
+            line_start: Some(item.line_start),
+            line_end: Some(item.line_end),
         });
+    }
+    for item in &file_symbols.impls {
+        if let Some(trait_name) = &item.trait_name {
+            rows.push(FileSymbolRow {
+                kind: FileSymbolKind::TraitImpl,
+                symbol: format!("<{} as {}>", item.target_type, trait_name),
+                line_start: Some(item.line_start),
+                line_end: Some(item.line_end),
+            });
+        }
     }
     for item in &file_symbols.consts {
         rows.push(FileSymbolRow {
             kind: FileSymbolKind::Const,
             symbol: item.name.clone(),
-            line_start: None,
-            line_end: None,
+            line_start: Some(item.line_start),
+            line_end: Some(item.line_end),
         });
     }
     for item in &file_symbols.statics {
         rows.push(FileSymbolRow {
             kind: FileSymbolKind::Static,
             symbol: item.name.clone(),
-            line_start: None,
-            line_end: None,
+            line_start: Some(item.line_start),
+            line_end: Some(item.line_end),
         });
     }
 
@@ -188,9 +213,14 @@ pub fn analyze_symbols_file(
     let structs = file_symbols.structs.len();
     let enums = file_symbols.enums.len();
     let traits = file_symbols.traits.len();
+    let trait_impls = file_symbols
+        .impls
+        .iter()
+        .filter(|item| item.trait_name.is_some())
+        .count();
     let consts = file_symbols.consts.len();
     let statics = file_symbols.statics.len();
-    let total = functions + structs + enums + traits + consts + statics;
+    let total = functions + structs + enums + traits + trait_impls + consts + statics;
 
     FileSymbolReport {
         file: file_display,
@@ -199,8 +229,10 @@ pub fn analyze_symbols_file(
         structs,
         enums,
         traits,
+        trait_impls,
         consts,
         statics,
+        parse_error: file_symbols.parse_error,
         symbols: rows,
     }
 }
@@ -210,14 +242,16 @@ pub fn render_symbol_report(report: &SymbolReport, verbose: bool) {
 
     if verbose {
         render::verbose_block(&[
-            "Counts are Rust AST items found in parseable files.",
-            "Functions includes free functions and impl methods.",
-            "Parse-error files are listed with zero symbols so the report stays deterministic.",
+            "symbols uses syn Rust AST item discovery.",
+            "It does not perform semantic name resolution, rustc analysis, macro expansion, or public API usage proof.",
+            "Functions include free functions and methods in any impl block; methods are counted once as functions.",
+            "trait_impls counts only impl Trait for Type blocks; inherent impl Type containers are not counted separately.",
+            "Parse-error files are surfaced with zero counts and parse_error=true in JSON.",
         ]);
     }
 
     println!(
-        "  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}",
+        "  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}",
         "total".cyan(),
         report.totals.total.to_string().bold(),
         "fn".cyan(),
@@ -228,8 +262,12 @@ pub fn render_symbol_report(report: &SymbolReport, verbose: bool) {
         report.totals.enums.to_string().bold(),
         "trait".cyan(),
         report.totals.traits.to_string().bold(),
-        "impl".cyan(),
-        report.totals.impls.to_string().bold(),
+        "trait_impl".cyan(),
+        report.totals.trait_impls.to_string().bold(),
+        "const".cyan(),
+        report.totals.consts.to_string().bold(),
+        "static".cyan(),
+        report.totals.statics.to_string().bold(),
     );
 
     if report.totals.parse_error_files > 0 {
@@ -242,26 +280,30 @@ pub fn render_symbol_report(report: &SymbolReport, verbose: bool) {
 
     println!();
     println!(
-        "  {:<48} {:>5} {:>5} {:>6} {:>5} {:>6} {:>5}",
+        "  {:<48} {:>5} {:>5} {:>6} {:>5} {:>6} {:>11} {:>6} {:>6}",
         "file".bold(),
         "total".bold(),
         "fn".bold(),
         "struct".bold(),
         "enum".bold(),
         "trait".bold(),
-        "impl".bold()
+        "trait_impl".bold(),
+        "const".bold(),
+        "static".bold()
     );
     for file in &report.files {
         let marker = if file.parse_error { " !" } else { "" };
         println!(
-            "  {:<48} {:>5} {:>5} {:>6} {:>5} {:>6} {:>5}",
+            "  {:<48} {:>5} {:>5} {:>6} {:>5} {:>6} {:>11} {:>6} {:>6}",
             truncate(&format!("{}{}", file.path, marker), 48),
             file.total,
             file.functions,
             file.structs,
             file.enums,
             file.traits,
-            file.impls,
+            file.trait_impls,
+            file.consts,
+            file.statics,
         );
     }
 }
@@ -293,14 +335,16 @@ pub fn render_file_symbol_report(report: &FileSymbolReport, verbose: bool) {
 
     if verbose {
         render::verbose_block(&[
-            "Counts are Rust AST items found in the selected file.",
-            "Functions includes free functions and impl methods.",
-            "Line spans are available for functions; other symbol kinds show lines -.",
+            "Selected-file mode is used when --path points at a Rust source file.",
+            "symbols uses syn Rust AST item discovery; it does not perform semantic name resolution, rustc analysis, macro expansion, or public API usage proof.",
+            "Functions include free functions and methods in any impl block; methods are counted once as functions.",
+            "trait_impls counts only impl Trait for Type blocks; inherent impl Type containers are not counted separately.",
+            "Line spans come from syn/proc-macro2 token spans for Rust item rows.",
         ]);
     }
 
     println!(
-        "  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}",
+        "  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}",
         "total".cyan(),
         report.total.to_string().bold(),
         "fn".cyan(),
@@ -311,11 +355,22 @@ pub fn render_file_symbol_report(report: &FileSymbolReport, verbose: bool) {
         report.enums.to_string().bold(),
         "trait".cyan(),
         report.traits.to_string().bold(),
+        "trait_impl".cyan(),
+        report.trait_impls.to_string().bold(),
         "const".cyan(),
         report.consts.to_string().bold(),
         "static".cyan(),
         report.statics.to_string().bold(),
     );
+
+    if report.parse_error {
+        println!(
+            "  {}",
+            "parse error: selected file could not be parsed"
+                .yellow()
+                .bold()
+        );
+    }
 
     println!();
     println!(
@@ -344,6 +399,7 @@ fn file_symbol_kind_label(kind: &FileSymbolKind) -> &'static str {
         FileSymbolKind::Struct => "struct",
         FileSymbolKind::Enum => "enum",
         FileSymbolKind::Trait => "trait",
+        FileSymbolKind::TraitImpl => "trait_impl",
         FileSymbolKind::Const => "const",
         FileSymbolKind::Static => "static",
     }

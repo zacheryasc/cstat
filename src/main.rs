@@ -33,7 +33,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Path to the Rust project directory (defaults to current directory)
+    /// Path to the Rust project directory or Rust source file
     #[arg(long, default_value = ".", global = true)]
     path: PathBuf,
 
@@ -62,7 +62,7 @@ enum Commands {
         #[arg(long)]
         top: Option<usize>,
     },
-    /// Symbol counts by kind and file
+    /// Rust AST symbol counts by kind, including trait impl blocks
     Symbols,
     /// Per-function and per-file complexity rankings
     Complexity,

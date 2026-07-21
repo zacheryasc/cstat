@@ -280,14 +280,14 @@ fn render_symbols(report: &symbols::FileSymbolReport, file: &str, verbose: bool)
     if verbose {
         let full_section = format!("Full section: cstat symbols --path {file} -v");
         render::verbose_block(&[
-            "Counts are Rust AST items found in the selected file.",
-            "Functions includes free functions and impl methods.",
+            "Selected-file symbols use syn Rust AST item discovery.",
+            "Functions include free functions and impl methods once.",
             full_section.as_str(),
         ]);
     }
 
     println!(
-        "  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}",
+        "  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}  {} {}",
         "total".cyan(),
         report.total.to_string().bold(),
         "fn".cyan(),
@@ -298,11 +298,22 @@ fn render_symbols(report: &symbols::FileSymbolReport, file: &str, verbose: bool)
         report.enums.to_string().bold(),
         "trait".cyan(),
         report.traits.to_string().bold(),
+        "trait_impl".cyan(),
+        report.trait_impls.to_string().bold(),
         "const".cyan(),
         report.consts.to_string().bold(),
         "static".cyan(),
         report.statics.to_string().bold(),
     );
+
+    if report.parse_error {
+        println!(
+            "  {}",
+            "parse error: selected file could not be parsed"
+                .yellow()
+                .bold()
+        );
+    }
 
     if !report.symbols.is_empty() {
         println!();
@@ -465,6 +476,7 @@ fn file_symbol_kind_label(kind: &symbols::FileSymbolKind) -> &'static str {
         symbols::FileSymbolKind::Struct => "struct",
         symbols::FileSymbolKind::Enum => "enum",
         symbols::FileSymbolKind::Trait => "trait",
+        symbols::FileSymbolKind::TraitImpl => "trait_impl",
         symbols::FileSymbolKind::Const => "const",
         symbols::FileSymbolKind::Static => "static",
     }
