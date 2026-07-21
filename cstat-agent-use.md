@@ -35,7 +35,11 @@ remain available under `cstat advanced ...`.
 
 Each accepts `--json` for structured output.
 
-- `cstat loc --json --path .` — line counts and directory breakdown.
+- `cstat loc --explain --json` — machine-readable `loc` contract: modes,
+  `code_lines` rules, project JSON fields, and selected-file JSON fields.
+- `cstat loc --json --path .` — project size-shape data.
+- `cstat loc --json --path src/lib.rs` — selected-file projected static line
+  reachability.
 - `cstat symbols --json --path .` — symbol totals by kind and per file.
 - `cstat deps --json --path .` — dependency edges, coupling, fan-in/fan-out,
   and cohesion.
@@ -82,5 +86,8 @@ Use these only when the focused report points to a question they answer:
   test/benchmark roots can reach a function or edge. They are not runtime hit-count profiling.
 - Dependency edges come from source-level `use`/`mod` relationships. Generated
   code and macro expansion can hide edges.
+- For exact `loc` `code_lines` rules and JSON fields, run
+  `cstat loc --explain` or `cstat loc --explain --json`; that command is the
+  canonical contract.
 - Prefer targeted reductions: remove dead code, split large files, move symbols
   across modules, then reduce per-function complexity.

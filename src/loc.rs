@@ -377,11 +377,13 @@ pub fn render_loc(files: &[PathBuf], project_path: &Path, top_n: Option<usize>, 
 
     if verbose {
         render::verbose_block(&[
-            "Bar chart: files ranked by code lines (excluding blank lines and comments).",
-            "Bar length is proportional to LoC relative to the largest file.",
+            "Bar chart: files ranked by code_lines.",
+            "code_lines excludes blank lines, // comment-only lines, and block-comment-only regions.",
+            "Line classification is static text scanning, not semantic Rust parsing.",
+            "Bar length is proportional to code_lines relative to the largest file.",
             "Color gradient: red = top of the ranking (most lines), green = bottom.",
+            "Full loc reference: cstat loc --explain.",
         ]);
-        render::guide_ref("size");
     }
 
     println!(
@@ -477,6 +479,71 @@ pub fn render_loc_file_json(rs_files: &[PathBuf], project_path: &Path, file: &Pa
     }
 }
 
+pub fn render_loc_explain(json: bool) {
+    if json {
+        render_loc_explain_json();
+    } else {
+        render_loc_explain_human();
+    }
+}
+
+fn render_loc_explain_human() {
+    render::section_header("loc reference");
+    println!("  Project mode: cstat loc --path .");
+    println!("  Project JSON: cstat loc --path . --json");
+    println!("  Selected-file mode: cstat loc --path src/lib.rs");
+    println!("  Selected-file JSON: cstat loc --path src/lib.rs --json");
+    println!("  Machine contract: cstat loc --explain --json");
+    println!();
+    println!("  code_lines: static textual classification");
+    println!("    excludes blank lines, // comment-only lines, and block-comment-only regions");
+    println!("    not semantic Rust parsing");
+    println!();
+    println!("  Project JSON fields: cstat_version, files, aggregate, directory_breakdown");
+    println!("  Selected-file JSON fields: file, total_lines, code_lines, projected_reachable_lines, projected_unreachable_lines, reachable_spans, unreachable_spans");
+}
+
+fn render_loc_explain_json() {
+    let output = serde_json::json!({
+        "cstat_version": env!("CARGO_PKG_VERSION"),
+        "probe": "loc",
+        "commands": {
+            "project_human": "cstat loc --path .",
+            "project_json": "cstat loc --path . --json",
+            "selected_file_human": "cstat loc --path src/lib.rs",
+            "selected_file_json": "cstat loc --path src/lib.rs --json",
+            "explain_human": "cstat loc --explain",
+            "explain_json": "cstat loc --explain --json",
+        },
+        "code_lines": {
+            "kind": "static textual classification",
+            "excludes": [
+                "blank lines",
+                "// comment-only lines",
+                "block-comment-only regions via simple /* ... */ state tracking",
+            ],
+            "not": "semantic Rust parsing",
+        },
+        "project_json_fields": {
+            "cstat_version": "cstat version string",
+            "files": ["path", "total_lines", "code_lines"],
+            "aggregate": ["total_files", "total_loc", "mean", "std_dev", "median", "min", "max"],
+            "directory_breakdown": ["directory", "code_lines"],
+        },
+        "selected_file_json_fields": {
+            "file": "selected file path relative to the crate root",
+            "total_lines": "physical lines in the selected file",
+            "code_lines": "production function-span code lines after exclusions",
+            "projected_reachable_lines": "production code lines in statically reachable function spans",
+            "projected_unreachable_lines": "production code lines not in statically reachable function spans",
+            "reachable_spans": ["function", "line_start", "line_end"],
+            "unreachable_spans": ["function", "line_start", "line_end"],
+        },
+    });
+
+    println!("{}", serde_json::to_string(&output).unwrap());
+}
+
 pub fn analyze_file_projected_line_reachability_from_files(
     rs_files: &[PathBuf],
     project_path: &Path,
@@ -511,8 +578,10 @@ pub fn render_file_projected_line_reachability_report(
     if verbose {
         render::verbose_block(&[
             "Physical lines count every source line in the selected file.",
-            "Code lines exclude blank/comment-only lines and test/support/wrapper spans for selected-file production accounting.",
+            "code_lines is production function-span code after excluding tests, benches, test-support helpers, and selected binary wrapper main().",
+            "Line classification excludes blank lines, // comment-only lines, and block-comment-only regions with simple text scanning.",
             "Projected reachable lines are production code lines inside functions statically reached from project tests/benches.",
+            "Full loc reference: cstat loc --explain.",
         ]);
     }
 

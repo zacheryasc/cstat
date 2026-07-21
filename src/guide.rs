@@ -64,30 +64,31 @@ when learning what the metrics mean.",
 fn topic_size() -> TopicContent {
     TopicContent {
         description: "\
-Size metrics measure the volume of code at file and function granularity. \
-Large files and functions are not inherently problematic, but they correlate \
-with higher defect density, harder navigation, and merge conflicts. The \
-distribution shape matters more than any single value.",
+Size metrics measure the volume and distribution of Rust source. `cstat loc` owns the line-count contract; run `cstat loc --explain` for modes, code_lines rules, and JSON fields.",
         metrics: &[
-            ("file LoC", "Total lines of code per file. High values may indicate a module doing too much."),
-            ("function LoC", "Lines per function body. Long functions tend to have higher cognitive load."),
-            ("mean / median", "Central tendency of the distribution. A large gap between mean and median indicates skew from outliers."),
-            ("std_dev", "Spread of the distribution. High values mean uneven file sizes."),
-            ("max", "The largest single file or function. Often the first place to investigate."),
+            (
+                "file size shape",
+                "Project-level file-size distribution from `cstat loc --path .`.",
+            ),
+            (
+                "selected-file line reachability",
+                "Projected static reachable/unreachable production spans from `cstat loc --path <file.rs>`.",
+            ),
+            (
+                "distribution statistics",
+                "Mean, median, std_dev, min, and max summarize project file sizes.",
+            ),
         ],
         commands: &[
-            "cstat loc               — per-file LoC with bar charts and directory breakdown",
-            "cstat loc --json        — structured file-level size data",
+            "cstat loc --explain       — loc modes, code_lines rules, and JSON field contract",
+            "cstat loc --path .        — project size-shape report",
+            "cstat loc --path src/lib.rs — selected-file projected line reachability",
             "cstat dist --metric loc — histogram and outlier analysis of LoC distribution",
         ],
         patterns: &[
-            "A right-skewed LoC distribution (long tail) usually means a few files have \
-grown disproportionately. Check whether those files contain multiple concerns.",
-            "Files above 500 lines often contain function clusters that could be separate \
-modules. Cross-reference with `cstat deps` to see if the file's functions form \
-distinct groups with few cross-calls.",
-            "Uniform file sizes are not a goal — some modules are naturally larger. The \
-signal is when a file is large AND has low cohesion or high internal complexity.",
+            "Use `cstat loc --explain` as the canonical reference before consuming loc output.",
+            "A right-skewed project-mode code_lines distribution means a few files dominate size.",
+            "Selected-file loc is a static projection from function spans and test/benchmark reachability; do not read it as runtime coverage.",
         ],
     }
 }
