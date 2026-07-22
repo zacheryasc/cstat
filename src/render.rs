@@ -133,11 +133,6 @@ pub fn print_stat_row(label: &str, value: &str) {
     println!("│ {:<11} │ {:>12} │", label.cyan(), value.bold());
 }
 
-/// Print a stat row with 16-char label column (used by complexity).
-pub fn print_stat_row_wide(label: &str, value: &str) {
-    println!("│ {:<16} │ {:>12} │", label.cyan(), value.bold());
-}
-
 /// Print a verbose explanation line with dimmed cyan ℹ prefix.
 pub fn verbose_line(text: &str) {
     println!("  {}", format!("ℹ {}", text).dimmed());

@@ -180,15 +180,11 @@ fn build_drilldowns(diagnostics: &[diagnostics::Diagnostic]) -> Vec<Drilldown> {
     // Map categories to subcommands
     let category_to_command: &[(&[&str], &str)] = &[
         (
-            &[
-                "bloated_function",
-                "high_complexity",
-                "high_cognitive",
-                "deep_nesting",
-                "too_many_params",
-            ],
-            "cstat complexity --json",
+            &["high_complexity", "high_cognitive", "deep_nesting"],
+            "cstat branching --json",
         ),
+        (&["too_many_params"], "cstat signature --json"),
+        (&["bloated_function"], "cstat span --json"),
         (&["redundant_code"], "cstat redundancy --json"),
         (&["bloated_file"], "cstat loc --json"),
         (
