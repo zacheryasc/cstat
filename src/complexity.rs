@@ -1,6 +1,6 @@
 use colored::Colorize;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 use syn::Expr;
 
@@ -15,25 +15,9 @@ pub struct FunctionComplexity {
     pub cyclomatic: usize,
     pub cognitive: usize,
     pub nesting_depth: usize,
-    pub generic_complexity: usize,
-    pub param_complexity: usize,
     pub composite_score: f64,
     pub line_count: usize,
     pub param_count: usize,
-}
-
-/// Complexity summary for a single file.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct FileComplexity {
-    pub path: String,
-    pub function_count: usize,
-    pub total_complexity: f64,
-    pub mean_complexity: f64,
-    pub max_complexity: f64,
-    pub total_generics: usize,
-    pub trait_impl_count: usize,
-    pub derive_density: f64,
 }
 
 /// Aggregate stats across all functions.
@@ -45,47 +29,60 @@ pub struct ComplexityStats {
     pub max: f64,
 }
 
-#[derive(Serialize)]
-struct FunctionComplexityJson {
-    name: String,
-    file: String,
-    cyclomatic: usize,
-    cognitive: usize,
-    nesting_depth: usize,
-    generic_complexity: usize,
-    param_complexity: usize,
-    composite_score: f64,
-    line_count: usize,
-    param_count: usize,
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchingRow {
+    pub function: String,
+    pub file: String,
+    pub cyclomatic: usize,
+    pub branch_points: usize,
+    pub nesting_depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SignatureRow {
+    pub function: String,
+    pub file: String,
+    pub param_count: usize,
+    pub return_type_complexity: usize,
+    pub generic_param_count: usize,
+    pub trait_bound_count: usize,
+    pub where_predicate_count: usize,
+    pub signature_score: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SignatureFileRow {
+    pub file: String,
+    pub trait_impl_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpanRow {
+    pub function: String,
+    pub file: String,
+    pub line_count: usize,
+    pub body_stmt_count: usize,
+    pub line_start: usize,
+    pub line_end: usize,
 }
 
 #[derive(Serialize)]
-struct FileComplexityJson {
-    path: String,
-    function_count: usize,
-    total_complexity: f64,
-    mean_complexity: f64,
-    max_complexity: f64,
-    total_generics: usize,
-    trait_impl_count: usize,
-    derive_density: f64,
-}
-
-#[derive(Serialize)]
-struct ComplexityStatsJson {
-    total_functions: usize,
-    mean: f64,
-    std_dev: f64,
-    median: f64,
-    max: f64,
-}
-
-#[derive(Serialize)]
-struct ComplexityJson {
+struct BranchingJson {
     cstat_version: String,
-    functions: Vec<FunctionComplexityJson>,
-    files: Vec<FileComplexityJson>,
-    stats: Option<ComplexityStatsJson>,
+    functions: Vec<BranchingRow>,
+}
+
+#[derive(Serialize)]
+struct SignatureJson {
+    cstat_version: String,
+    functions: Vec<SignatureRow>,
+    files: Vec<SignatureFileRow>,
+}
+
+#[derive(Serialize)]
+struct SpanJson {
+    cstat_version: String,
+    functions: Vec<SpanRow>,
 }
 
 /// Compute complexity metrics for a single function.
@@ -110,11 +107,7 @@ fn compute_function_complexity(func: &FunctionInfo, source: &str) -> FunctionCom
         + generic_complexity as f64 * 0.2
         + param_complexity as f64 * 0.1;
 
-    let line_count = if func.line_end >= func.line_start {
-        func.line_end - func.line_start + 1
-    } else {
-        func.body_stmt_count.max(1)
-    };
+    let line_count = function_line_count(func);
 
     FunctionComplexity {
         name: func.name.clone(),
@@ -122,8 +115,6 @@ fn compute_function_complexity(func: &FunctionInfo, source: &str) -> FunctionCom
         cyclomatic,
         cognitive,
         nesting_depth: func.nesting_depth,
-        generic_complexity,
-        param_complexity,
         composite_score,
         line_count,
         param_count: func.param_count,
@@ -376,86 +367,6 @@ pub fn compute_all(symbols: &ProjectSymbols, project_path: &Path) -> Vec<Functio
 }
 
 /// Compute per-file complexity aggregation.
-pub fn compute_file_complexity(
-    symbols: &ProjectSymbols,
-    func_complexities: &[FunctionComplexity],
-    project_path: &Path,
-) -> Vec<FileComplexity> {
-    let mut file_map: std::collections::HashMap<String, Vec<&FunctionComplexity>> =
-        std::collections::HashMap::new();
-
-    for fc in func_complexities {
-        file_map.entry(fc.file.clone()).or_default().push(fc);
-    }
-
-    let mut file_complexities: Vec<FileComplexity> = symbols
-        .files
-        .iter()
-        .map(|file_syms| {
-            let path = strip_project_path(&file_syms.path.display().to_string(), project_path);
-            let funcs = file_map.get(&path).cloned().unwrap_or_default();
-            let function_count = funcs.len();
-            let scores: Vec<f64> = funcs.iter().map(|f| f.composite_score).collect();
-            let total_complexity: f64 = scores.iter().sum();
-            let mean_complexity = if function_count > 0 {
-                total_complexity / function_count as f64
-            } else {
-                0.0
-            };
-            let max_complexity = scores.iter().cloned().fold(0.0f64, f64::max);
-
-            let total_generics: usize = file_syms
-                .structs
-                .iter()
-                .map(|s| s.generic_param_count)
-                .sum::<usize>()
-                + file_syms
-                    .enums
-                    .iter()
-                    .map(|e| e.generic_param_count)
-                    .sum::<usize>();
-            let trait_impl_count = file_syms
-                .impls
-                .iter()
-                .filter(|i| i.trait_name.is_some())
-                .count();
-            let total_types = file_syms.structs.len() + file_syms.enums.len();
-            let total_derives: usize = file_syms
-                .structs
-                .iter()
-                .map(|s| s.derive_count)
-                .sum::<usize>()
-                + file_syms
-                    .enums
-                    .iter()
-                    .map(|e| e.derive_count)
-                    .sum::<usize>();
-            let derive_density = if total_types > 0 {
-                total_derives as f64 / total_types as f64
-            } else {
-                0.0
-            };
-
-            FileComplexity {
-                path,
-                function_count,
-                total_complexity,
-                mean_complexity,
-                max_complexity,
-                total_generics,
-                trait_impl_count,
-                derive_density,
-            }
-        })
-        .collect();
-
-    file_complexities.sort_by(|a, b| {
-        b.total_complexity
-            .partial_cmp(&a.total_complexity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    file_complexities
-}
 
 /// Compute aggregate stats across all function complexities.
 pub fn compute_stats(complexities: &[FunctionComplexity]) -> Option<ComplexityStats> {
@@ -495,283 +406,380 @@ fn strip_project_path(path: &str, project_path: &Path) -> String {
     stripped.to_string()
 }
 
-/// Render the function complexity rankings table.
-fn render_function_rankings(
-    func_complexities: &[FunctionComplexity],
-    _term_w: usize,
-    verbose: bool,
-) {
-    println!(
-        "\n{}",
-        "\u{2500}\u{2500} Function Complexity Rankings \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
-            .bright_cyan()
-            .bold()
-    );
+fn relative_file(path: &Path, project_path: &Path) -> String {
+    strip_project_path(&path.display().to_string(), project_path)
+}
 
-    if verbose {
-        render::verbose_block(&[
-            "Functions ranked by composite complexity score (highest = most complex).",
-            "Each column is an individual complexity metric:",
-            "  Cycl = cyclomatic complexity = number of linearly independent paths",
-            "         through the function (branch points + 1). Higher = more branches.",
-            "  Cogn = cognitive complexity (SonarSource model): +1 per control flow break",
-            "         (if, for, while, match, &&, ||), plus a nesting penalty per level.",
-            "  Nest = deepest nesting depth in the function body.",
-            "  Gen  = generic complexity = type params + trait bounds + where predicates.",
-            "  Param = parameter count + return type complexity.",
-            "  Score = composite: 1.0\u{00d7}Cycl + 0.5\u{00d7}Cogn + 0.3\u{00d7}Nest + 0.2\u{00d7}Gen + 0.1\u{00d7}Param.",
-            "Color: red = highest score, green = lowest. Functions sorted descending by Score.",
-        ]);
-        render::guide_ref("complexity");
-    }
-
-    let display_count = func_complexities.len().min(20);
-    println!(
-        "{} functions analyzed, showing top {}\n",
-        format!("{}", func_complexities.len()).bold(),
-        format!("{}", display_count).bold(),
-    );
-
-    // Header
-    println!(
-        "  {:<40} {:>5} {:>5} {:>5} {:>5} {:>5} {:>7}",
-        "Function".bold().underline(),
-        "Cycl".bold().underline(),
-        "Cogn".bold().underline(),
-        "Nest".bold().underline(),
-        "Gen".bold().underline(),
-        "Param".bold().underline(),
-        "Score".bold().underline(),
-    );
-
-    for (i, fc) in func_complexities.iter().take(display_count).enumerate() {
-        let ratio = i as f64 / display_count.max(1) as f64;
-        let name_display = if fc.name.len() > 38 {
-            format!("{}...", &fc.name[..35])
-        } else {
-            fc.name.clone()
-        };
-
-        let score_str = format!("{:.1}", fc.composite_score);
-        let colored_score = render::bar_color(&score_str, ratio);
-
-        println!(
-            "  {:<40} {:>5} {:>5} {:>5} {:>5} {:>5} {}",
-            name_display.dimmed(),
-            fc.cyclomatic,
-            fc.cognitive,
-            fc.nesting_depth,
-            fc.generic_complexity,
-            fc.param_complexity,
-            colored_score,
-        );
-    }
-
-    if func_complexities.len() > display_count {
-        println!(
-            "{}",
-            format!(
-                "  ... and {} more functions",
-                func_complexities.len() - display_count
-            )
-            .dimmed()
-        );
+fn function_line_count(func: &FunctionInfo) -> usize {
+    if func.line_end >= func.line_start {
+        func.line_end - func.line_start + 1
+    } else {
+        func.body_stmt_count.max(1)
     }
 }
 
-/// Render the per-file complexity bar chart.
-fn render_file_complexity_chart(
-    file_complexities: &[FileComplexity],
-    term_w: usize,
-    verbose: bool,
-) {
-    println!(
-        "\n{}",
-        "\u{2500}\u{2500} Per-File Complexity \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
-            .bright_cyan()
-            .bold()
-    );
+fn signature_score(func: &FunctionInfo) -> usize {
+    func.param_count
+        + func.return_type_complexity
+        + func.generic_param_count
+        + func.trait_bound_count
+        + func.where_predicate_count
+}
 
-    if verbose {
-        render::verbose_block(&[
-            "Total composite complexity score per file (sum of all function scores in the file).",
-            "Bar length is proportional to the file with the highest total score.",
-            "Color: red = top of ranking, green = bottom. Files sorted descending.",
-        ]);
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
     }
 
-    let file_display_count = file_complexities.len().min(20);
-    let display_files = &file_complexities[..file_display_count];
+    let keep = max.saturating_sub(3);
+    let mut out = value.chars().take(keep).collect::<String>();
+    out.push_str("...");
+    out
+}
 
-    let max_label_len = display_files
+pub fn collect_branching(symbols: &ProjectSymbols, project_path: &Path) -> Vec<BranchingRow> {
+    let mut rows: Vec<BranchingRow> = symbols
+        .files
         .iter()
-        .map(|f| f.path.len())
-        .max()
-        .unwrap_or(0)
-        .min(40);
+        .flat_map(|file| file.functions.iter())
+        .map(|func| BranchingRow {
+            function: func.name.clone(),
+            file: relative_file(&func.file, project_path),
+            cyclomatic: func.branch_points + 1,
+            branch_points: func.branch_points,
+            nesting_depth: func.nesting_depth,
+        })
+        .collect();
 
-    let max_score = display_files
+    rows.sort_by(|a, b| {
+        b.cyclomatic
+            .cmp(&a.cyclomatic)
+            .then_with(|| b.branch_points.cmp(&a.branch_points))
+            .then_with(|| b.nesting_depth.cmp(&a.nesting_depth))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.function.cmp(&b.function))
+    });
+    rows
+}
+
+pub fn collect_signatures(symbols: &ProjectSymbols, project_path: &Path) -> Vec<SignatureRow> {
+    let mut rows: Vec<SignatureRow> = symbols
+        .files
         .iter()
-        .map(|f| f.total_complexity)
-        .fold(0.0f64, f64::max);
+        .flat_map(|file| file.functions.iter())
+        .map(|func| SignatureRow {
+            function: func.name.clone(),
+            file: relative_file(&func.file, project_path),
+            param_count: func.param_count,
+            return_type_complexity: func.return_type_complexity,
+            generic_param_count: func.generic_param_count,
+            trait_bound_count: func.trait_bound_count,
+            where_predicate_count: func.where_predicate_count,
+            signature_score: signature_score(func),
+        })
+        .collect();
 
-    let score_digits = format!("{:.1}", max_score).len();
-    let bar_budget = term_w
-        .saturating_sub(max_label_len)
-        .saturating_sub(3) // " \u{2502} "
-        .saturating_sub(score_digits)
-        .saturating_sub(2)
-        .max(10);
-
-    println!();
-    for (i, fc) in display_files.iter().enumerate() {
-        let ratio = i as f64 / file_display_count.max(1) as f64;
-        let label = if fc.path.len() > 40 {
-            format!("...{}", &fc.path[fc.path.len() - 37..])
-        } else {
-            fc.path.clone()
-        };
-
-        let bar_len = if max_score > 0.0 {
-            (fc.total_complexity / max_score * bar_budget as f64).ceil() as usize
-        } else {
-            0
-        }
-        .max(if fc.total_complexity > 0.0 { 1 } else { 0 });
-
-        let bar_str = "\u{2588}".repeat(bar_len);
-        let colored_bar = render::bar_color(&bar_str, ratio);
-
-        println!(
-            "{:>width$} \u{2502} {}{} {}",
-            label.dimmed(),
-            colored_bar,
-            " ".repeat(bar_budget.saturating_sub(bar_len)),
-            format!("{:.1}", fc.total_complexity).bold(),
-            width = max_label_len,
-        );
-    }
-
-    if file_complexities.len() > file_display_count {
-        println!(
-            "{}",
-            format!(
-                "  ... and {} more files",
-                file_complexities.len() - file_display_count
-            )
-            .dimmed()
-        );
-    }
+    rows.sort_by(|a, b| {
+        b.signature_score
+            .cmp(&a.signature_score)
+            .then_with(|| b.param_count.cmp(&a.param_count))
+            .then_with(|| b.return_type_complexity.cmp(&a.return_type_complexity))
+            .then_with(|| b.generic_param_count.cmp(&a.generic_param_count))
+            .then_with(|| b.trait_bound_count.cmp(&a.trait_bound_count))
+            .then_with(|| b.where_predicate_count.cmp(&a.where_predicate_count))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.function.cmp(&b.function))
+    });
+    rows
 }
 
-/// Render the aggregate complexity statistics box.
-fn render_complexity_stats(stats: &ComplexityStats, verbose: bool) {
-    println!(
-        "\n{}",
-        "\u{2500}\u{2500} Complexity Statistics \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
-            .bright_cyan()
-            .bold()
-    );
+pub fn collect_signature_files(
+    symbols: &ProjectSymbols,
+    project_path: &Path,
+) -> Vec<SignatureFileRow> {
+    let mut rows: Vec<SignatureFileRow> = symbols
+        .files
+        .iter()
+        .map(|file_syms| SignatureFileRow {
+            file: relative_file(&file_syms.path, project_path),
+            trait_impl_count: file_syms
+                .impls
+                .iter()
+                .filter(|imp| imp.trait_name.is_some())
+                .count(),
+        })
+        .collect();
 
-    if verbose {
-        render::verbose_block(&[
-            "Aggregate statistics for composite complexity across all functions.",
-            "Mean = average score. Std Dev = spread. Median = middle value (robust to outliers).",
-            "Max = highest individual function score in the project.",
-        ]);
-    }
-
-    println!("\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{252c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}");
-    render::print_stat_row_wide("Total functions", &format!("{}", stats.total_functions));
-    render::print_stat_row_wide("Mean score", &format!("{:.2}", stats.mean));
-    render::print_stat_row_wide("Std Dev", &format!("{:.2}", stats.std_dev));
-    render::print_stat_row_wide("Median score", &format!("{:.2}", stats.median));
-    render::print_stat_row_wide("Max score", &format!("{:.2}", stats.max));
-    println!("\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2534}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}");
+    rows.sort_by(|a, b| {
+        b.trait_impl_count
+            .cmp(&a.trait_impl_count)
+            .then_with(|| a.file.cmp(&b.file))
+    });
+    rows
 }
 
-/// Render the complexity subcommand output.
-pub fn render_complexity(symbols: &ProjectSymbols, project_path: &Path, verbose: bool) {
-    let func_complexities = compute_all(symbols, project_path);
+pub fn collect_spans(symbols: &ProjectSymbols, project_path: &Path) -> Vec<SpanRow> {
+    let mut rows: Vec<SpanRow> = symbols
+        .files
+        .iter()
+        .flat_map(|file| file.functions.iter())
+        .map(|func| SpanRow {
+            function: func.name.clone(),
+            file: relative_file(&func.file, project_path),
+            line_count: function_line_count(func),
+            body_stmt_count: func.body_stmt_count,
+            line_start: func.line_start,
+            line_end: func.line_end,
+        })
+        .collect();
 
-    if func_complexities.is_empty() {
+    rows.sort_by(|a, b| {
+        b.line_count
+            .cmp(&a.line_count)
+            .then_with(|| b.body_stmt_count.cmp(&a.body_stmt_count))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.function.cmp(&b.function))
+    });
+    rows
+}
+
+pub fn render_branching(symbols: &ProjectSymbols, project_path: &Path, verbose: bool) {
+    let rows = collect_branching(symbols, project_path);
+    if rows.is_empty() {
         println!("{}", "No functions found to analyze.".yellow());
         return;
     }
 
-    let file_complexities = compute_file_complexity(symbols, &func_complexities, project_path);
-    let stats = compute_stats(&func_complexities);
-    let term_w = render::terminal_width();
-
-    render_function_rankings(&func_complexities, term_w, verbose);
-    render_file_complexity_chart(&file_complexities, term_w, verbose);
-
-    if let Some(ref stats) = stats {
-        render_complexity_stats(stats, verbose);
+    render::section_header("Function Branching Complexity");
+    if verbose {
+        render::verbose_block(&[
+            "Functions ranked by decision/path complexity.",
+            "Cyclomatic complexity is branch_points + 1.",
+            "Branch points and nesting depth come from the parsed control-flow visitor.",
+            "cognitive and composite_score are intentionally not part of this view.",
+        ]);
     }
 
+    let display_count = rows.len().min(20);
+    println!(
+        "{} functions analyzed, showing top {}\n",
+        format!("{}", rows.len()).bold(),
+        format!("{}", display_count).bold(),
+    );
+    println!(
+        "  {:<40} {:<30} {:>5} {:>8} {:>5}",
+        "Function".bold().underline(),
+        "File".bold().underline(),
+        "Cycl".bold().underline(),
+        "Branches".bold().underline(),
+        "Nest".bold().underline(),
+    );
+
+    for row in rows.iter().take(display_count) {
+        println!(
+            "  {:<40} {:<30} {:>5} {:>8} {:>5}",
+            truncate(&row.function, 40).dimmed(),
+            truncate(&row.file, 30).dimmed(),
+            row.cyclomatic,
+            row.branch_points,
+            row.nesting_depth,
+        );
+    }
+
+    if rows.len() > display_count {
+        println!(
+            "{}",
+            format!("  ... and {} more functions", rows.len() - display_count).dimmed()
+        );
+    }
     println!();
 }
 
-/// Render complexity analysis as JSON.
-pub fn render_complexity_json(symbols: &ProjectSymbols, project_path: &Path) {
-    let func_complexities = compute_all(symbols, project_path);
-    let file_complexities = compute_file_complexity(symbols, &func_complexities, project_path);
-    let stats = compute_stats(&func_complexities);
-
-    let functions: Vec<FunctionComplexityJson> = func_complexities
-        .iter()
-        .map(|fc| FunctionComplexityJson {
-            name: fc.name.clone(),
-            file: fc.file.clone(),
-            cyclomatic: fc.cyclomatic,
-            cognitive: fc.cognitive,
-            nesting_depth: fc.nesting_depth,
-            generic_complexity: fc.generic_complexity,
-            param_complexity: fc.param_complexity,
-            composite_score: fc.composite_score,
-            line_count: fc.line_count,
-            param_count: fc.param_count,
-        })
-        .collect();
-
-    let files: Vec<FileComplexityJson> = file_complexities
-        .iter()
-        .map(|fc| FileComplexityJson {
-            path: fc.path.clone(),
-            function_count: fc.function_count,
-            total_complexity: fc.total_complexity,
-            mean_complexity: fc.mean_complexity,
-            max_complexity: fc.max_complexity,
-            total_generics: fc.total_generics,
-            trait_impl_count: fc.trait_impl_count,
-            derive_density: fc.derive_density,
-        })
-        .collect();
-
-    let stats_json = stats.map(|s| ComplexityStatsJson {
-        total_functions: s.total_functions,
-        mean: s.mean,
-        std_dev: s.std_dev,
-        median: s.median,
-        max: s.max,
-    });
-
-    let output = ComplexityJson {
+pub fn render_branching_json(symbols: &ProjectSymbols, project_path: &Path) {
+    let output = BranchingJson {
         cstat_version: env!("CARGO_PKG_VERSION").to_string(),
-        functions,
-        files,
-        stats: stats_json,
+        functions: collect_branching(symbols, project_path),
     };
 
     println!("{}", serde_json::to_string(&output).unwrap());
 }
 
-pub fn run(rs_files: &[std::path::PathBuf], project_path: &Path, json: bool, verbose: bool) {
+pub fn render_signature(symbols: &ProjectSymbols, project_path: &Path, verbose: bool) {
+    let rows = collect_signatures(symbols, project_path);
+    let file_rows = collect_signature_files(symbols, project_path);
+
+    render::section_header("Function Signature Complexity");
+    if verbose {
+        render::verbose_block(&[
+            "Functions ranked by API-boundary complexity.",
+            "Signature score = params + return type complexity + generic params + trait bounds + where predicates.",
+            "This view answers call/satisfy/reason-about difficulty, not control-flow or implementation span.",
+        ]);
+    }
+
+    if rows.is_empty() {
+        println!("{}", "No functions found to analyze.".yellow());
+    } else {
+        let display_count = rows.len().min(20);
+        println!(
+            "{} functions analyzed, showing top {}\n",
+            format!("{}", rows.len()).bold(),
+            format!("{}", display_count).bold(),
+        );
+        println!(
+            "  {:<34} {:<24} {:>6} {:>6} {:>8} {:>6} {:>5} {:>5}",
+            "Function".bold().underline(),
+            "File".bold().underline(),
+            "Params".bold().underline(),
+            "Return".bold().underline(),
+            "Generics".bold().underline(),
+            "Bounds".bold().underline(),
+            "Where".bold().underline(),
+            "Score".bold().underline(),
+        );
+
+        for row in rows.iter().take(display_count) {
+            println!(
+                "  {:<34} {:<24} {:>6} {:>6} {:>8} {:>6} {:>5} {:>5}",
+                truncate(&row.function, 34).dimmed(),
+                truncate(&row.file, 24).dimmed(),
+                row.param_count,
+                row.return_type_complexity,
+                row.generic_param_count,
+                row.trait_bound_count,
+                row.where_predicate_count,
+                row.signature_score,
+            );
+        }
+
+        if rows.len() > display_count {
+            println!(
+                "{}",
+                format!("  ... and {} more functions", rows.len() - display_count).dimmed()
+            );
+        }
+    }
+
+    if !file_rows.is_empty() {
+        render::section_header("Trait Implementations by File");
+        let display_count = file_rows.len().min(20);
+        println!(
+            "  {:<40} {:>10}",
+            "File".bold().underline(),
+            "TraitImpls".bold().underline(),
+        );
+        for row in file_rows.iter().take(display_count) {
+            println!(
+                "  {:<40} {:>10}",
+                truncate(&row.file, 40).dimmed(),
+                row.trait_impl_count,
+            );
+        }
+        if file_rows.len() > display_count {
+            println!(
+                "{}",
+                format!("  ... and {} more files", file_rows.len() - display_count).dimmed()
+            );
+        }
+    }
+    println!();
+}
+
+pub fn render_signature_json(symbols: &ProjectSymbols, project_path: &Path) {
+    let output = SignatureJson {
+        cstat_version: env!("CARGO_PKG_VERSION").to_string(),
+        functions: collect_signatures(symbols, project_path),
+        files: collect_signature_files(symbols, project_path),
+    };
+
+    println!("{}", serde_json::to_string(&output).unwrap());
+}
+
+pub fn render_span(symbols: &ProjectSymbols, project_path: &Path, verbose: bool) {
+    let rows = collect_spans(symbols, project_path);
+    if rows.is_empty() {
+        println!("{}", "No functions found to analyze.".yellow());
+        return;
+    }
+
+    render::section_header("Function Implementation Span");
+    if verbose {
+        render::verbose_block(&[
+            "Functions ranked by implementation-unit size.",
+            "line_count is the inclusive function-local line_start..=line_end span.",
+            "This does not replace cstat loc, which remains file/project LOC.",
+        ]);
+    }
+
+    let display_count = rows.len().min(20);
+    println!(
+        "{} functions analyzed, showing top {}\n",
+        format!("{}", rows.len()).bold(),
+        format!("{}", display_count).bold(),
+    );
+    println!(
+        "  {:<40} {:<30} {:>5} {:>5} {:>5} {:>5}",
+        "Function".bold().underline(),
+        "File".bold().underline(),
+        "Lines".bold().underline(),
+        "Stmts".bold().underline(),
+        "Start".bold().underline(),
+        "End".bold().underline(),
+    );
+
+    for row in rows.iter().take(display_count) {
+        println!(
+            "  {:<40} {:<30} {:>5} {:>5} {:>5} {:>5}",
+            truncate(&row.function, 40).dimmed(),
+            truncate(&row.file, 30).dimmed(),
+            row.line_count,
+            row.body_stmt_count,
+            row.line_start,
+            row.line_end,
+        );
+    }
+
+    if rows.len() > display_count {
+        println!(
+            "{}",
+            format!("  ... and {} more functions", rows.len() - display_count).dimmed()
+        );
+    }
+    println!();
+}
+
+pub fn render_span_json(symbols: &ProjectSymbols, project_path: &Path) {
+    let output = SpanJson {
+        cstat_version: env!("CARGO_PKG_VERSION").to_string(),
+        functions: collect_spans(symbols, project_path),
+    };
+
+    println!("{}", serde_json::to_string(&output).unwrap());
+}
+
+pub fn run_branching(rs_files: &[PathBuf], project_path: &Path, json: bool, verbose: bool) {
     let symbols = crate::ast_parser::parse_project(rs_files);
     if json {
-        render_complexity_json(&symbols, project_path);
+        render_branching_json(&symbols, project_path);
     } else {
-        render_complexity(&symbols, project_path, verbose);
+        render_branching(&symbols, project_path, verbose);
+    }
+}
+
+pub fn run_signature(rs_files: &[PathBuf], project_path: &Path, json: bool, verbose: bool) {
+    let symbols = crate::ast_parser::parse_project(rs_files);
+    if json {
+        render_signature_json(&symbols, project_path);
+    } else {
+        render_signature(&symbols, project_path, verbose);
+    }
+}
+
+pub fn run_span(rs_files: &[PathBuf], project_path: &Path, json: bool, verbose: bool) {
+    let symbols = crate::ast_parser::parse_project(rs_files);
+    if json {
+        render_span_json(&symbols, project_path);
+    } else {
+        render_span(&symbols, project_path, verbose);
     }
 }

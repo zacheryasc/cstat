@@ -193,51 +193,53 @@ fn render_loc_bars(file_stats: &[loc::FileLocStats], project_path_canon: &Path, 
     }
 }
 
-/// Render the complexity hotspots table.
+/// Render the branching hotspots table.
 fn render_complexity_section(func_complexities: &[complexity::FunctionComplexity], verbose: bool) {
-    render::section_header("Complexity Hotspots");
+    render::section_header("Branching Hotspots");
 
     if verbose {
         render::verbose_block(&[
-            "Functions ranked by composite complexity score (highest first).",
-            "Composite Score = 1.0×Cyclomatic + 0.5×Cognitive + 0.3×Nesting + 0.2×Generics + 0.1×Params.",
+            "Functions ranked by cyclomatic branching complexity (highest first).",
             "Cycl = cyclomatic complexity = branch points + 1 (linearly independent paths).",
-            "Cogn = cognitive complexity (SonarSource model): +1 per control flow break, +nesting penalty.",
-            "Nest = deepest nesting depth within the function body.",
-            "Score column: red = highest complexity, green = lowest. See 'cstat complexity' for full detail.",
+            "Branches = cyclomatic - 1. Nest = deepest nesting depth within the function body.",
+            "See 'cstat branching', 'cstat signature', and 'cstat span' for focused detail.",
         ]);
     }
 
     if func_complexities.is_empty() {
         println!("  {}", "No functions found.".dimmed());
     } else {
-        let display_count = func_complexities.len().min(10);
+        let mut rows: Vec<_> = func_complexities.iter().collect();
+        rows.sort_by(|a, b| {
+            b.cyclomatic
+                .cmp(&a.cyclomatic)
+                .then_with(|| b.nesting_depth.cmp(&a.nesting_depth))
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let display_count = rows.len().min(10);
         println!(
-            "  {:<36} {:>5} {:>5} {:>5} {:>7}",
+            "  {:<36} {:>5} {:>8} {:>5}",
             "Function".bold().underline(),
             "Cycl".bold().underline(),
-            "Cogn".bold().underline(),
+            "Branches".bold().underline(),
             "Nest".bold().underline(),
-            "Score".bold().underline(),
         );
 
-        for (i, fc) in func_complexities.iter().take(display_count).enumerate() {
-            let ratio = i as f64 / display_count.max(1) as f64;
+        for fc in rows.into_iter().take(display_count) {
             let name = if fc.name.len() > 34 {
                 format!("{}...", &fc.name[..31])
             } else {
                 fc.name.clone()
             };
-            let score_str = format!("{:.1}", fc.composite_score);
-            let colored_score = render::bar_color(&score_str, ratio);
 
             println!(
-                "  {:<36} {:>5} {:>5} {:>5} {}",
+                "  {:<36} {:>5} {:>8} {:>5}",
                 name.dimmed(),
                 fc.cyclomatic,
-                fc.cognitive,
+                fc.cyclomatic.saturating_sub(1),
                 fc.nesting_depth,
-                colored_score,
             );
         }
         if func_complexities.len() > display_count {

@@ -64,8 +64,12 @@ enum Commands {
     },
     /// Symbol counts by kind and file
     Symbols,
-    /// Per-function and per-file complexity rankings
-    Complexity,
+    /// Function decision/path complexity rankings
+    Branching,
+    /// Function API boundary complexity rankings
+    Signature,
+    /// Function implementation span rankings
+    Span,
     /// Module dependency connectome
     Deps {
         /// Show only the top N most connected modules
@@ -209,8 +213,14 @@ fn main() {
                     symbols::render_symbols_file(project_rs_files, project_path, file, verbose);
                 }
             }
-            Commands::Complexity => {
-                complexity::run(target_rs_files, project_path, json, verbose);
+            Commands::Branching => {
+                complexity::run_branching(target_rs_files, project_path, json, verbose);
+            }
+            Commands::Signature => {
+                complexity::run_signature(target_rs_files, project_path, json, verbose);
+            }
+            Commands::Span => {
+                complexity::run_span(target_rs_files, project_path, json, verbose);
             }
             Commands::Cluster => {
                 if json {
@@ -321,8 +331,14 @@ fn main() {
                 symbols::render_symbols(&rs_files, &project_path, verbose);
             }
         }
-        Commands::Complexity => {
-            complexity::run(&rs_files, &project_path, json, verbose);
+        Commands::Branching => {
+            complexity::run_branching(&rs_files, &project_path, json, verbose);
+        }
+        Commands::Signature => {
+            complexity::run_signature(&rs_files, &project_path, json, verbose);
+        }
+        Commands::Span => {
+            complexity::run_span(&rs_files, &project_path, json, verbose);
         }
         Commands::Cluster => {
             cluster::render_cluster(&rs_files, &project_path, json, verbose);

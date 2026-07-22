@@ -52,7 +52,7 @@ or `cstat dump` for a machine-readable JSON diagnostic report.",
         ],
         patterns: &[
             "Human workflow: run summary first, read the dashboard, drill into specific \
-dimensions with loc/complexity/deps/flow/graph as needed.",
+dimensions with loc/branching/signature/span/deps/flow/graph as needed.",
             "Agent workflow: run dump for the full diagnostic picture, read scores to \
 identify weak dimensions, use individual commands with --json to explore specifics.",
             "The -v (verbose) flag adds contextual explanations to any command — useful \
@@ -95,22 +95,23 @@ signal is when a file is large AND has low cohesion or high internal complexity.
 fn topic_complexity() -> TopicContent {
     TopicContent {
         description: "\
-Complexity metrics quantify different aspects of how difficult code is to \
-understand, test, and modify. No single metric captures the full picture — \
-cyclomatic counts paths, cognitive models reading difficulty, nesting measures \
+Complexity metrics are split by question: branching for decision/path shape, \
+signature for API-boundary difficulty, and span for function-local implementation \
+size. No single metric captures the full picture — cyclomatic counts paths, \
+cognitive models reading difficulty in diagnostics/distributions, nesting measures \
 structural depth, and parameter count reflects interface width.",
         metrics: &[
             ("cyclomatic complexity", "Number of linearly independent paths through a function (branch_points + 1). Higher values mean more test cases needed for full coverage."),
-            ("cognitive complexity", "SonarSource model: +1 per control flow break, +nesting_level penalty. Models how hard the code is for a human to read."),
+            ("cognitive complexity", "SonarSource model: +1 per control flow break, +nesting_level penalty. Used by diagnostics/distributions, not exposed as a top-level probe."),
             ("nesting depth", "Maximum depth of nested control structures. Deep nesting forces readers to hold more context in working memory."),
             ("parameter count", "Number of function parameters. Wide interfaces are harder to call correctly and may indicate a function doing too much."),
-            ("composite score", "Weighted combination: 1.0×cyclomatic + 0.5×cognitive + 0.3×nesting + 0.2×generic + 0.1×param. Useful for ranking."),
+            ("function span", "Inclusive function-local line range and top-level body statement count. This complements file/project LOC."),
         ],
         commands: &[
-            "cstat complexity        — per-function and per-file complexity rankings",
-            "cstat complexity --json — structured complexity data for all functions",
-            "cstat dist --metric cyclomatic — distribution and outlier analysis",
-            "cstat dist --metric cognitive  — cognitive complexity distribution",
+            "cstat branching        — decision/path complexity by function",
+            "cstat signature        — API-boundary complexity by function and file",
+            "cstat span             — function-local implementation size and line ranges",
+            "cstat advanced dist --metric cyclomatic — distribution and outlier analysis",
         ],
         patterns: &[
             "High cyclomatic but low cognitive complexity usually means straightforward \
@@ -118,8 +119,8 @@ branching (e.g. match statements with simple arms). High cognitive with \
 moderate cyclomatic often means nested conditionals.",
             "Functions with nesting depth > 4 are nearly always worth refactoring — \
 extract inner blocks into helper functions to flatten the structure.",
-            "The composite score is useful for triage: sort by composite to find functions \
-that are complex along multiple dimensions simultaneously.",
+            "Use branching, signature, and span together: a function can be easy to call \
+but branch-heavy, short but hard to satisfy generically, or long without many decisions.",
         ],
     }
 }
