@@ -26,6 +26,7 @@ struct CouplingPairJson {
     module_b: String,
     strength: usize,
     direction: String,
+    edges: Vec<DepEdgeJson>,
 }
 
 #[derive(Serialize)]
@@ -116,7 +117,7 @@ fn render_matrix_rows(
 fn render_matrix_legend(display_modules: &[&String]) {
     println!();
     println!(
-        "  {} no dependency  {} unidirectional  {} bidirectional",
+        "  {} no dependency  {} one-way pair  {} bidirectional pair",
         "0".dimmed(),
         "1".yellow(),
         "2".red().bold(),
@@ -138,13 +139,14 @@ fn render_dependency_matrix(analysis: &DepAnalysis, top_n: usize, term_w: usize,
 
     if verbose {
         render::verbose_block(&[
-            "Matrix showing coupling intensity between module pairs.",
-            "Cell [row, col] = 0 (dim, no dependency), 1 (yellow, unidirectional),",
-            "  2 (red/bold, bidirectional — both modules import each other).",
+            "Matrix showing coupling strength between module pairs.",
+            "Cells are pair strength, not edge direction: 0 = no dependency,",
+            "  1 = exactly one direction exists, 2 = both modules import each other.",
             "Diagonal is marked '·' (a module cannot depend on itself).",
             "Modules are sorted by total connectivity (in + out degree).",
             "Row/column indices map to module names shown in the legend below the matrix.",
-            "Built from 'use' and 'mod' statements found by parsing each file's AST.",
+            "Use Coupling Ranking or JSON edges for source -> target direction.",
+            "Built from top-level source 'use' and external 'mod' statements parsed from each file.",
         ]);
         render::guide_ref("modularity");
     }
@@ -204,9 +206,9 @@ fn render_coupling_ranking(analysis: &DepAnalysis, top_n: usize, verbose: bool) 
     if verbose {
         render::verbose_block(&[
             "Module pairs ranked by coupling strength.",
+            "One-way rows show actual source module -> target module direction.",
             "◆ bidirectional (red) = both modules import each other. This is a coupling risk —",
             "  changes in either module may ripple to the other.",
-            "→ unidirectional (yellow) = one-way dependency, lower risk.",
             "Pairs are sorted by coupling strength descending, then alphabetically.",
         ]);
     }
@@ -217,37 +219,52 @@ fn render_coupling_ranking(analysis: &DepAnalysis, top_n: usize, verbose: bool) 
     }
 
     let display_count = analysis.coupling_pairs.len().min(top_n);
+    let edge_set: HashSet<(&str, &str)> = analysis
+        .edges
+        .iter()
+        .map(|edge| (edge.from.as_str(), edge.to.as_str()))
+        .collect();
     println!(
         "\n  {:<30} {:<30} {}",
-        "Module A".bold().underline(),
-        "Module B".bold().underline(),
+        "From".bold().underline(),
+        "To".bold().underline(),
         "Coupling".bold().underline(),
     );
 
     for (a, b, strength) in analysis.coupling_pairs.iter().take(display_count) {
-        let coupling_label = if *strength >= 2 {
-            "◆ bidirectional".red().bold().to_string()
+        let a_to_b = edge_set.contains(&(a.as_str(), b.as_str()));
+        let b_to_a = edge_set.contains(&(b.as_str(), a.as_str()));
+        let (from, to, coupling_label) = if a_to_b && b_to_a {
+            (
+                a.as_str(),
+                b.as_str(),
+                "◆ bidirectional".red().bold().to_string(),
+            )
+        } else if a_to_b {
+            (a.as_str(), b.as_str(), "→ one-way".yellow().to_string())
         } else {
-            "→ unidirectional".yellow().to_string()
+            (b.as_str(), a.as_str(), "→ one-way".yellow().to_string())
         };
 
-        let a_display = if a.len() > 28 {
-            format!("..{}", &a[a.len() - 26..])
+        let from_display = if from.len() > 28 {
+            format!("..{}", &from[from.len() - 26..])
         } else {
-            a.clone()
+            from.to_string()
         };
-        let b_display = if b.len() > 28 {
-            format!("..{}", &b[b.len() - 26..])
+        let to_display = if to.len() > 28 {
+            format!("..{}", &to[to.len() - 26..])
         } else {
-            b.clone()
+            to.to_string()
         };
 
         println!(
             "  {:<30} {:<30} {}",
-            a_display.dimmed(),
-            b_display.dimmed(),
+            from_display.dimmed(),
+            to_display.dimmed(),
             coupling_label
         );
+
+        let _ = strength;
     }
 
     if analysis.coupling_pairs.len() > display_count {
@@ -403,11 +420,11 @@ fn render_cohesion_section(cohesion: &[ModuleCohesion], top_n: usize, verbose: b
 
     if verbose {
         render::verbose_block(&[
-            "Per-module cohesion scores measuring internal focus/coherence.",
-            "Call cohesion: fraction of functions calling another function in the same module.",
-            "Type cohesion: fraction of functions sharing parameter/return types within the module.",
+            "Per-source-module cohesion scores measuring internal focus/coherence.",
+            "Call cohesion: fraction of parsed source functions calling another function in the same source module.",
+            "Type cohesion: fraction of parsed source functions sharing signature type tokens within the module.",
             "Combined: weighted average (60% call + 40% type), 0.0–1.0 where higher = more cohesive.",
-            "Low cohesion suggests the module bundles unrelated functionality.",
+            "Low cohesion suggests the source module bundles unrelated functionality.",
             "Modules sorted by combined cohesion ascending (least cohesive first).",
         ]);
     }
@@ -505,18 +522,39 @@ pub fn render_deps_json(rs_files: &[PathBuf], project_path: &Path) {
         })
         .collect();
 
+    let edge_set: HashSet<(&str, &str)> = analysis
+        .edges
+        .iter()
+        .map(|edge| (edge.from.as_str(), edge.to.as_str()))
+        .collect();
     let coupling_pairs: Vec<CouplingPairJson> = analysis
         .coupling_pairs
         .iter()
-        .map(|(a, b, s)| CouplingPairJson {
-            module_a: a.clone(),
-            module_b: b.clone(),
-            strength: *s,
-            direction: if *s >= 2 {
-                "bidirectional".to_string()
-            } else {
-                "unidirectional".to_string()
-            },
+        .map(|(a, b, s)| {
+            let mut pair_edges = Vec::new();
+            if edge_set.contains(&(a.as_str(), b.as_str())) {
+                pair_edges.push(DepEdgeJson {
+                    from: a.clone(),
+                    to: b.clone(),
+                });
+            }
+            if edge_set.contains(&(b.as_str(), a.as_str())) {
+                pair_edges.push(DepEdgeJson {
+                    from: b.clone(),
+                    to: a.clone(),
+                });
+            }
+            CouplingPairJson {
+                module_a: a.clone(),
+                module_b: b.clone(),
+                strength: *s,
+                direction: if *s >= 2 {
+                    "bidirectional".to_string()
+                } else {
+                    "unidirectional".to_string()
+                },
+                edges: pair_edges,
+            }
         })
         .collect();
 

@@ -762,14 +762,16 @@ fn render_entry_listing(listing: &EntryListing) {
 
 fn render_human(output: &CallTraceJson, verbose: bool) {
     println!("cstat call trace");
+    println!("static possible-call expansion; not a runtime execution trace");
     if verbose {
         render::verbose_block(&[
-            "Static call graph rendered from one selected root.",
+            "Built from cstat's Rust source call graph.",
+            "Branches are not evaluated; every statically resolved callee is shown.",
             "Cycles stop expansion; shared functions expand in each stack.",
         ]);
     }
 
-    println!("resolved:");
+    println!("resolved entry:");
     match output.resolved.source {
         EntrySource::CargoRun => {
             println!("  cargo command: cargo run --");
@@ -801,19 +803,22 @@ fn render_human(output: &CallTraceJson, verbose: bool) {
         }
     }
 
-    println!();
-    render_trace_node(&output.tree);
-    println!();
-    println!("summary:");
+    println!("static expansion summary:");
     println!("  functions reached: {}", output.functions_reached);
     println!("  max depth: {}", output.max_depth);
+
+    println!();
+    println!("tree:");
+    render_trace_node(&output.tree);
 }
 
 fn render_file_call_trace_report(report: &FileCallTraceReport, verbose: bool) {
     println!("cstat file call trace ({})", report.file);
+    println!("static possible-call expansion per non-test function; not runtime execution traces");
     if verbose {
         render::verbose_block(&[
-            "Static call graph rendered for every non-test function in the selected file.",
+            "Built from cstat's Rust source call graph.",
+            "Branches are not evaluated; every statically resolved callee is shown.",
             "Cycles stop expansion; shared functions expand in each stack.",
         ]);
     }

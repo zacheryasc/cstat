@@ -481,11 +481,6 @@ fn type_complexity(ty: &Type) -> usize {
     }
 }
 
-/// Convert a Type to a readable string (public wrapper for cross-module use).
-pub fn type_to_string_pub(ty: &Type) -> String {
-    type_to_string(ty)
-}
-
 /// Convert a Type to a readable string.
 fn type_to_string(ty: &Type) -> String {
     match ty {

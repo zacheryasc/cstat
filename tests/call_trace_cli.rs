@@ -51,6 +51,14 @@ fn call_trace_infers_cargo_run_entry() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cstat call trace"), "stdout={stdout}");
     assert!(
+        stdout.contains("static possible-call expansion; not a runtime execution trace"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("static expansion summary:"),
+        "stdout={stdout}"
+    );
+    assert!(
         stdout.contains("cargo command: cargo run --"),
         "stdout={stdout}"
     );

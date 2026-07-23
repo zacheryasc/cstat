@@ -63,6 +63,16 @@ fn run_cstat(path: &Path, export: &Path, args: &[&str]) -> Output {
     command.output().expect("invoke cstat binary")
 }
 
+fn run_cstat_without_export(path: &Path, args: &[&str]) -> Output {
+    let bin = env!("CARGO_BIN_EXE_cstat");
+    let mut command = Command::new(bin);
+    command.args(["--no-color", "--path"]);
+    command.arg(path);
+    command.args(args);
+    command.env_remove("CSTAT_LLVM_COV_EXPORT_JSON");
+    command.output().expect("invoke cstat binary")
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -73,6 +83,32 @@ fn assert_success(output: &Output) {
     );
 }
 
+#[test]
+fn coverage_verbose_prints_guidance_before_no_run_env_error() {
+    let root = temp_project("missing-env");
+    let output = run_cstat_without_export(&root, &["coverage", "--no-run", "-v"]);
+    assert!(
+        !output.status.success(),
+        "coverage --no-run without export env should fail"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Normal mode runs cargo test with Rust source-based coverage flags"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("Use coverage --no-run with CSTAT_LLVM_COV_EXPORT_JSON"),
+        "stdout={stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("CSTAT_LLVM_COV_EXPORT_JSON is required"),
+        "stderr={stderr}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
 #[test]
 fn coverage_no_run_reports_dynamic_lines_and_branches_from_export_json() {
     let root = temp_project("json");
@@ -116,7 +152,7 @@ fn coverage_human_separates_static_projected_dynamic_and_branch_sections() {
     let root = temp_project("human");
     let file = root.join("src/lib.rs");
     let export = export_json(&root);
-    let output = run_cstat(&file, &export, &["coverage", "--no-run"]);
+    let output = run_cstat(&file, &export, &["coverage", "--no-run", "-v"]);
     assert_success(&output);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -126,13 +162,27 @@ fn coverage_human_separates_static_projected_dynamic_and_branch_sections() {
         "Dynamic line coverage",
         "Branch coverage",
     ] {
-        assert!(stdout.contains(section), "missing {section}: {stdout}");
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| line.trim_start().starts_with(&format!("┌─ {section}")))
+                .count(),
+            1,
+            "section header should appear once: {section}: {stdout}"
+        );
     }
-    assert!(stdout.contains("missing lines: 5"), "stdout={stdout}");
-    assert!(
-        stdout.contains("line 2: flag missing false"),
-        "stdout={stdout}"
-    );
+    for expected in [
+        "Normal mode runs cargo test with Rust source-based coverage flags",
+        "Line coverage is dynamic llvm-cov segment data; branch coverage uses branch records when the Rust/LLVM toolchain emits them.",
+        "Reachability is computed from the static call graph; it is not runtime coverage.",
+        "Projected reachable lines are production code lines inside functions statically reached from project tests/benches.",
+        "Coverable/executed lines come from llvm-cov segment counts after cstat's production-span filter.",
+        "Branch coverage counts true/false outcomes from llvm-cov branch records.",
+        "missing lines: 5",
+        "line 2: flag missing false",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
     assert!(!stdout.contains("Path coverage"), "stdout={stdout}");
 
     fs::remove_dir_all(root).unwrap();

@@ -58,7 +58,16 @@ pub struct ToolStatus {
     pub llvm_profdata: Option<String>,
     pub profile_dir: Option<String>,
     pub export_source: String,
+    pub branch_instrumentation_enabled: Option<bool>,
 }
+
+const COVERAGE_VERBOSE_INTRO: &[&str] = &[
+    "Normal mode runs cargo test with Rust source-based coverage flags before reading llvm-cov export data.",
+    "Use coverage --no-run with CSTAT_LLVM_COV_EXPORT_JSON to analyze an existing llvm-cov export.",
+    "Line coverage is dynamic llvm-cov segment data; branch coverage uses branch records when the Rust/LLVM toolchain emits them.",
+    "Production spans exclude tests, benches, test-support helpers, and selected src/bin wrapper main().",
+    "Selected-file static/projected sections are static reachability context, not runtime coverage.",
+];
 
 pub fn render_coverage(
     rs_files: &[PathBuf],
@@ -66,6 +75,7 @@ pub fn render_coverage(
     selected_file: Option<&Path>,
     no_run: bool,
     json: bool,
+    verbose: bool,
 ) -> Result<(), String> {
     let symbols = ast_parser::parse_project(rs_files);
     let graph = flow::build_call_graph(rs_files, project_path);
@@ -77,24 +87,37 @@ pub fn render_coverage(
         selected_file,
     );
 
-    let (export_json, mut status) = if no_run {
+    let export_result = if no_run {
         let export_path = std::env::var("CSTAT_LLVM_COV_EXPORT_JSON").map_err(|_| {
             "CSTAT_LLVM_COV_EXPORT_JSON is required when coverage --no-run is used".to_string()
-        })?;
-        let content = std::fs::read_to_string(&export_path)
-            .map_err(|e| format!("failed to read CSTAT_LLVM_COV_EXPORT_JSON={export_path}: {e}"))?;
-        (
-            content,
-            ToolStatus {
-                ran_tests: false,
-                llvm_cov: None,
-                llvm_profdata: None,
-                profile_dir: None,
-                export_source: export_path,
-            },
-        )
+        });
+        export_path.and_then(|export_path| {
+            let content = std::fs::read_to_string(&export_path).map_err(|e| {
+                format!("failed to read CSTAT_LLVM_COV_EXPORT_JSON={export_path}: {e}")
+            })?;
+            Ok((
+                content,
+                ToolStatus {
+                    ran_tests: false,
+                    llvm_cov: None,
+                    llvm_profdata: None,
+                    profile_dir: None,
+                    branch_instrumentation_enabled: None,
+                    export_source: export_path,
+                },
+            ))
+        })
     } else {
-        collect_coverage_export(project_path, selected_file)?
+        collect_coverage_export(project_path, selected_file)
+    };
+    let (export_json, mut status) = match export_result {
+        Ok(result) => result,
+        Err(message) => {
+            if verbose && !json {
+                render_coverage_verbose_intro();
+            }
+            return Err(message);
+        }
     };
 
     let mut report = analyze_export_json(&export_json, project_path, selected_file, &filter)?;
@@ -131,7 +154,7 @@ pub fn render_coverage(
             serde_json::to_string(&report).map_err(|e| e.to_string())?
         );
     } else {
-        render_coverage_report(&report, selected_file.is_some(), &status);
+        render_coverage_report(&report, selected_file.is_some(), &status, verbose);
     }
     Ok(())
 }
@@ -299,11 +322,21 @@ pub fn analyze_export_json(
             llvm_profdata: None,
             profile_dir: None,
             export_source: "provided_json".to_string(),
+            branch_instrumentation_enabled: None,
         },
     })
 }
 
-fn render_coverage_report(report: &CoverageReport, selected_file: bool, status: &ToolStatus) {
+fn render_coverage_verbose_intro() {
+    render::verbose_block(COVERAGE_VERBOSE_INTRO);
+}
+
+fn render_coverage_report(
+    report: &CoverageReport,
+    selected_file: bool,
+    status: &ToolStatus,
+    verbose: bool,
+) {
     println!(
         "\n{} {}",
         "cstat coverage".bright_cyan().bold(),
@@ -311,19 +344,27 @@ fn render_coverage_report(report: &CoverageReport, selected_file: bool, status: 
     );
     println!("  {} {}", "source".cyan(), status.export_source);
 
+    if verbose {
+        render_coverage_verbose_intro();
+    }
+
     if selected_file {
-        render::section_header("Static test/benchmark reachability");
         if let Some(static_reachability) = &report.static_reachability {
-            datapaths::render_file_static_reachability_report(static_reachability, false);
+            datapaths::render_file_static_reachability_report(static_reachability, verbose);
         }
-        render::section_header("Projected line reachability");
         loc::render_file_projected_line_reachability_report(
             &report.projected_line_reachability,
-            false,
+            verbose,
         );
     }
 
     render::section_header("Dynamic line coverage");
+    if verbose {
+        render::verbose_block(&[
+            "Coverable/executed lines come from llvm-cov segment counts after cstat's production-span filter.",
+            "Missing lines are coverable production lines whose execution count was zero in the export.",
+        ]);
+    }
     println!(
         "  executed lines {} / {} ({:.1}%)  missing {}",
         report
@@ -352,11 +393,20 @@ fn render_coverage_report(report: &CoverageReport, selected_file: bool, status: 
     }
 
     render::section_header("Branch coverage");
+    if verbose {
+        render::verbose_block(&[
+            "Branch coverage counts true/false outcomes from llvm-cov branch records.",
+            "When cstat runs coverage itself, Rust branch records require nightly -Z coverage-options=branch.",
+            "When branch data is absent, cstat reports the section as unavailable instead of inventing branch counts.",
+        ]);
+    }
     if report.branch_coverage.total_branch_outcomes == 0 {
-        println!(
-            "  {}",
-            "branch data unavailable in llvm-cov export".yellow()
-        );
+        let message = match status.branch_instrumentation_enabled {
+            Some(false) => "branch data unavailable: this rustc does not expose nightly -Z coverage-options=branch, so cstat collected line/region coverage only",
+            Some(true) => "branch data unavailable: llvm-cov export contained no branch records for included production files",
+            None => "branch data unavailable: llvm-cov export contained no branch records for included production files",
+        };
+        println!("  {}", message.yellow());
         return;
     }
     println!(
@@ -455,6 +505,23 @@ fn coverage_profile_dir(target_dir: &Path) -> PathBuf {
     target_dir.join("cstat-coverage")
 }
 
+fn captured_command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    let mut details = String::new();
+
+    if !stdout.trim().is_empty() {
+        details.push_str("\n\ncargo test stdout:\n");
+        details.push_str(stdout.trim_end());
+    }
+    if !stderr.trim().is_empty() {
+        details.push_str("\n\ncargo test stderr:\n");
+        details.push_str(stderr.trim_end());
+    }
+
+    details
+}
+
 fn collect_coverage_export(
     project_path: &Path,
     selected_file: Option<&Path>,
@@ -476,10 +543,16 @@ fn collect_coverage_export(
     }
 
     let cargo_args = cargo_test_args(project_path, selected_file);
+    let branch_instrumentation_enabled = rustc_supports_branch_coverage();
+    let existing_rustflags = std::env::var("RUSTFLAGS").ok();
+    let rustflags = coverage_rustflags(
+        existing_rustflags.as_deref(),
+        branch_instrumentation_enabled,
+    );
     let mut cargo = Command::new("cargo");
     cargo.args(&cargo_args);
-    let status = cargo
-        .env("RUSTFLAGS", "-C instrument-coverage -C link-dead-code")
+    let output = cargo
+        .env("RUSTFLAGS", rustflags)
         .env(
             "LLVM_PROFILE_FILE",
             profile_dir
@@ -487,11 +560,13 @@ fn collect_coverage_export(
                 .to_string_lossy()
                 .to_string(),
         )
-        .status()
+        .output()
         .map_err(|e| format!("failed to run cargo test for coverage: {e}"))?;
-    if !status.success() {
+    if !output.status.success() {
         return Err(format!(
-            "cargo test for coverage failed with status {status}"
+            "cargo test for coverage failed with status {}{}",
+            output.status,
+            captured_command_output(&output.stdout, &output.stderr),
         ));
     }
 
@@ -553,6 +628,7 @@ fn collect_coverage_export(
             llvm_profdata: Some(llvm_profdata.to_string_lossy().to_string()),
             profile_dir: Some(profile_dir.to_string_lossy().to_string()),
             export_source: format_command("cargo", &cargo_args),
+            branch_instrumentation_enabled: Some(branch_instrumentation_enabled),
         },
     ))
 }
@@ -695,6 +771,30 @@ fn format_command(program: &str, args: &[String]) -> String {
         .join(" ")
 }
 
+fn coverage_rustflags(existing_rustflags: Option<&str>, enable_branch_coverage: bool) -> String {
+    let mut flags = existing_rustflags
+        .map(str::trim)
+        .filter(|flags| !flags.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    if !flags.is_empty() {
+        flags.push(' ');
+    }
+    flags.push_str("-C instrument-coverage -C link-dead-code");
+    if enable_branch_coverage {
+        flags.push_str(" -Z coverage-options=branch");
+    }
+    flags
+}
+
+fn rustc_supports_branch_coverage() -> bool {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| std::ffi::OsString::from("rustc"));
+    let Ok(output) = Command::new(rustc).arg("-Z").arg("help").output() else {
+        return false;
+    };
+    output.status.success() && String::from_utf8_lossy(&output.stdout).contains("coverage-options")
+}
+
 fn find_tool(env_key: &str, binary: &str) -> Result<PathBuf, String> {
     if let Some(value) = std::env::var_os(env_key) {
         let path = PathBuf::from(value);
@@ -720,7 +820,7 @@ fn find_tool(env_key: &str, binary: &str) -> Result<PathBuf, String> {
             return Ok(candidate);
         }
     }
-    Err("LLVM coverage tools unavailable; install rustup component llvm-tools-preview or set LLVM_COV and LLVM_PROFDATA".to_string())
+    Err("LLVM coverage tools unavailable; install rustup component llvm-tools-preview or set LLVM_COV and LLVM_PROFDATA, or use coverage --no-run with CSTAT_LLVM_COV_EXPORT_JSON".to_string())
 }
 
 fn rustc_sysroot() -> Result<String, String> {
@@ -1222,6 +1322,22 @@ path = "src/bin/mvp_chat.rs"
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn coverage_rustflags_preserve_existing_flags_and_enable_branch_option() {
+        assert_eq!(
+            coverage_rustflags(None, false),
+            "-C instrument-coverage -C link-dead-code"
+        );
+        assert_eq!(
+            coverage_rustflags(Some("-C debuginfo=2"), false),
+            "-C debuginfo=2 -C instrument-coverage -C link-dead-code"
+        );
+        assert_eq!(
+            coverage_rustflags(Some("-C debuginfo=2"), true),
+            "-C debuginfo=2 -C instrument-coverage -C link-dead-code -Z coverage-options=branch"
+        );
     }
 
     #[test]

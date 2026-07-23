@@ -188,21 +188,21 @@ fn test_reachability_json_uses_reachability_fields() {
 }
 
 #[test]
-fn focused_report_json_renames_top_level_field() {
-    let root = temp_project("report-json");
-    let output = run_cstat(&root, &["--json", "report"]);
-    assert_success(&output);
+fn stale_summary_report_and_advanced_commands_are_unavailable() {
+    let root = temp_project("stale-commands");
 
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let value: Value = serde_json::from_str(&stdout).expect("parse focused report JSON");
-    assert!(value.get("test_reachability").is_some());
-    assert!(value.get("datapaths").is_none());
-    assert_eq!(value["test_reachability"]["reachable_function_count"], 3);
-    assert_eq!(value["test_reachability"]["unreachable_function_count"], 1);
-    for field in ["line_counts", "symbols", "dependencies", "dead_code"] {
+    for args in [
+        &["summary"][..],
+        &["report"][..],
+        &["advanced"][..],
+        &["advanced", "flow-heatmap", "--walks", "10"][..],
+    ] {
+        let output = run_cstat(&root, args);
         assert!(
-            value.get(field).is_some(),
-            "missing focused report field: {field}"
+            !output.status.success(),
+            "stale command unexpectedly succeeded for {args:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 
@@ -210,52 +210,7 @@ fn focused_report_json_renames_top_level_field() {
 }
 
 #[test]
-fn advanced_flow_heatmap_runs_legacy_random_walk_analysis() {
-    let root = temp_project("advanced");
-    let output = run_cstat(&root, &["advanced", "flow-heatmap", "--walks", "10"]);
-    assert_success(&output);
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Execution Flow Heatmap"), "stdout={stdout}");
-    assert!(stdout.contains("random walks"), "stdout={stdout}");
-    assert!(
-        !stdout.contains("Static test/benchmark reachability"),
-        "stdout={stdout}"
-    );
-
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn old_focused_datapaths_command_is_not_available() {
-    let root = temp_project("old-command");
-    let output = run_cstat(&root, &["datapaths"]);
-    assert!(
-        !output.status.success(),
-        "legacy root command unexpectedly succeeded: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn old_advanced_datapaths_command_is_not_available() {
-    let root = temp_project("old-advanced-command");
-    let output = run_cstat(&root, &["advanced", "datapaths"]);
-    assert!(
-        !output.status.success(),
-        "legacy advanced command unexpectedly succeeded: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn help_lists_test_reachability_and_advanced_flow_heatmap() {
+fn help_lists_focused_commands_and_omits_pruned_commands() {
     let root = temp_project("help");
 
     let root_help = run_cstat(&root, &["--help"]);
@@ -269,30 +224,14 @@ fn help_lists_test_reachability_and_advanced_flow_heatmap() {
         root_stdout.contains("Static test/benchmark reachability"),
         "stdout={root_stdout}"
     );
-    assert!(
-        !root_stdout
-            .lines()
-            .any(|line| line.starts_with("  datapaths")),
-        "root help still listed datapaths: {root_stdout}"
-    );
-
-    let advanced_help = run_cstat(&root, &["advanced", "--help"]);
-    assert_success(&advanced_help);
-    let advanced_stdout = String::from_utf8_lossy(&advanced_help.stdout);
-    assert!(
-        advanced_stdout.contains("flow-heatmap"),
-        "stdout={advanced_stdout}"
-    );
-    assert!(
-        !advanced_stdout
-            .lines()
-            .any(|line| line.starts_with("  datapaths")),
-        "advanced help still listed datapaths: {advanced_stdout}"
-    );
-    assert!(
-        advanced_stdout.contains("random-walk") || advanced_stdout.contains("heatmap"),
-        "stdout={advanced_stdout}"
-    );
+    for pruned in ["summary", "report", "advanced", "datapaths"] {
+        assert!(
+            !root_stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(pruned)),
+            "help still listed pruned command {pruned}: {root_stdout}"
+        );
+    }
 
     fs::remove_dir_all(root).unwrap();
 }

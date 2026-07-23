@@ -9,28 +9,18 @@ and tests preserve behavior.
 
 ## Starting point
 
-Run the focused report first:
+Start with the focused commands that answer the current cleanup question:
 
 ```sh
-cstat report --json --path <project_root>
+cstat loc --json --path <project_root>
+cstat symbols --json --path <project_root>
+cstat deps --json --path <project_root>
+cstat dead-code --json --path <project_root>
+cstat test-reachability --json --path <project_root>
 ```
 
-Omitting the command is equivalent to `cstat summary`, which is the same focused
-report. The JSON contains:
-
-- `line_counts`: total code lines, physical lines, and per-file counts.
-- `symbols`: total and per-file counts for functions, structs, enums, traits,
-  `trait_impls`, consts, statics, and parse-error state. `trait_impls` means
-  `impl Trait for Type` blocks only, not inherent `impl Type` blocks.
-- `dependencies`: module list, module interdependency matrix, edge count, and
-  fan-in/fan-out degrees.
-- `dead_code`: functions not statically reachable from main, tests, or
-  benchmarks.
-- `test_reachability`: static test/benchmark reachability, step counts, max
-  depth, and per-function/per-edge reaching-entry counts.
-
-The focused report intentionally excludes older exploratory dashboards. They
-remain available under `cstat advanced ...`.
+The stale `summary`, `report`, and `advanced` entry points have been removed.
+Use focused root commands directly.
 
 ## Focused drilldowns
 
@@ -48,28 +38,14 @@ Each accepts `--json` for structured output.
 - `cstat dead-code --json --path .` — static cold-function candidates.
 - `cstat test-reachability --json --path .` — static test/benchmark
   reachability and reaching-entry counts.
-- `cstat complexity --json --path .` — per-function cyclomatic, cognitive,
-  nesting, parameter, and line metrics.
+- `cstat branching --json --path .` — per-function decision/path complexity.
+- `cstat signature --json --path .` — per-function API boundary complexity.
+- `cstat span --json --path .` — per-function implementation span metrics.
 
-## Advanced / legacy commands
-
-Use these only when the focused report points to a question they answer:
-
-- `cstat advanced summary --json --path .` — previous broad dashboard.
-- `cstat advanced flow --json --path .` — raw static call graph.
-- `cstat advanced graph --json --path .` — graph centrality, SCCs, PageRank.
-- `cstat advanced flow-heatmap --json --path .` — previous random-walk heatmap.
-- `cstat advanced circuits --json --path .` — call-graph community detection.
-- `cstat advanced redundancy --json --path .` — similar/duplicate function
-  candidates.
-- `cstat advanced dist --json --path .` — metric histograms/correlation views.
-- `cstat advanced map --json --path .` — terminal architecture map.
-- `cstat advanced dump --path .` — previous diagnostic-score dump.
-- `cstat advanced guide <topic>` — metric reference material.
 
 ## Cleanup workflow
 
-1. Run `cstat report --json --path .`.
+1. Run the focused `cstat` commands that match the cleanup target.
 2. Read the focused sections in this order:
    - line counts: find oversized files first;
    - symbols: find files with too many definitions;
@@ -77,8 +53,8 @@ Use these only when the focused report points to a question they answer:
    - dead code: review cold candidates before deleting;
    - test reachability: compare code surface against what tests/benches can statically reach.
 3. Plan one cleanup stage at a time.
-4. After each stage, rerun `cstat report --json --path .` and the project's own
-   build/tests. cstat metrics do not prove correctness.
+4. After each stage, rerun the same focused `cstat` commands and the project's
+   own build/tests. cstat metrics do not prove correctness.
 
 ## Safety rules
 

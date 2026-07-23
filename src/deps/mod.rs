@@ -113,19 +113,57 @@ fn collect_use_paths(tree: &syn::UseTree, prefix: &mut Vec<String>, results: &mu
     }
 }
 
-/// Match a use path to a known project module name.
-fn resolve_to_module(use_path: &str, known_modules: &HashSet<String>) -> Option<String> {
-    let path = if let Some(rest) = use_path.strip_prefix("crate::") {
-        rest
-    } else if let Some(rest) = use_path.strip_prefix("self::") {
-        rest
-    } else if let Some(rest) = use_path.strip_prefix("super::") {
-        rest
-    } else {
-        use_path
-    };
+/// Match a use/mod path to a known project module name from a source-module context.
+fn resolve_to_module(
+    use_path: &str,
+    known_modules: &HashSet<String>,
+    current_module: &str,
+) -> Option<String> {
+    if use_path == "crate" {
+        return None;
+    }
+    if use_path == "self" {
+        return known_modules
+            .contains(current_module)
+            .then(|| current_module.to_string());
+    }
+    if use_path == "super" {
+        return parent_module(current_module)
+            .filter(|parent| known_modules.contains(*parent))
+            .map(ToString::to_string);
+    }
 
-    let parts: Vec<&str> = path.split("::").collect();
+    if let Some(rest) = use_path.strip_prefix("crate::") {
+        return resolve_absolute_module_path(rest, known_modules);
+    }
+
+    if let Some(rest) = use_path.strip_prefix("self::") {
+        return resolve_relative_module_path(current_module, rest, known_modules).or_else(|| {
+            known_modules
+                .contains(current_module)
+                .then(|| current_module.to_string())
+        });
+    }
+
+    let mut base = current_module;
+    let mut rest = use_path;
+    let mut saw_super = false;
+    while let Some(stripped) = rest.strip_prefix("super::") {
+        saw_super = true;
+        base = parent_module(base).unwrap_or("");
+        rest = stripped;
+    }
+    if saw_super {
+        return resolve_relative_module_path(base, rest, known_modules)
+            .or_else(|| known_modules.contains(base).then(|| base.to_string()));
+    }
+
+    resolve_relative_module_path(current_module, use_path, known_modules)
+        .or_else(|| resolve_absolute_module_path(use_path, known_modules))
+}
+
+fn resolve_absolute_module_path(path: &str, known_modules: &HashSet<String>) -> Option<String> {
+    let parts: Vec<&str> = path.split("::").filter(|part| !part.is_empty()).collect();
     for len in (1..=parts.len()).rev() {
         let candidate = parts[..len].join("::");
         if known_modules.contains(&candidate) {
@@ -133,6 +171,26 @@ fn resolve_to_module(use_path: &str, known_modules: &HashSet<String>) -> Option<
         }
     }
     None
+}
+
+fn resolve_relative_module_path(
+    base: &str,
+    path: &str,
+    known_modules: &HashSet<String>,
+) -> Option<String> {
+    if base.is_empty() {
+        return resolve_absolute_module_path(path, known_modules);
+    }
+    let absolute = if path.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}::{path}")
+    };
+    resolve_absolute_module_path(&absolute, known_modules)
+}
+
+fn parent_module(module: &str) -> Option<&str> {
+    module.rsplit_once("::").map(|(parent, _)| parent)
 }
 
 /// Compute coupling pairs from the edge set, sorted by strength descending.
@@ -209,7 +267,7 @@ pub fn analyze_deps(rs_files: &[PathBuf], project_path: &Path) -> DepAnalysis {
         let mut seen_targets: HashSet<String> = HashSet::new();
 
         for target in &use_targets {
-            if let Some(to_module) = resolve_to_module(target, &known_modules) {
+            if let Some(to_module) = resolve_to_module(target, &known_modules, &from_module) {
                 if to_module != from_module && seen_targets.insert(to_module.clone()) {
                     let edge = DepEdge {
                         from: from_module.clone(),
@@ -260,7 +318,7 @@ pub fn analyze_file_deps(
     let mut internal = Vec::new();
     let mut external = Vec::new();
     for raw in use_targets {
-        if let Some(resolved_module) = resolve_to_module(&raw, &known_modules) {
+        if let Some(resolved_module) = resolve_to_module(&raw, &known_modules, &module) {
             internal.push(FileDependency {
                 raw,
                 resolved_module: Some(resolved_module),
@@ -350,7 +408,15 @@ fn relative_path_string(project_path: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// Compute call cohesion: fraction of functions calling another function in the same module.
+fn function_graph_name(file_module: &str, function_name: &str) -> String {
+    if file_module == "main" || file_module == "lib" {
+        function_name.to_string()
+    } else {
+        format!("{file_module}::{function_name}")
+    }
+}
+
+/// Compute call cohesion: fraction of source functions calling another function in the same module.
 fn compute_call_cohesion(
     module_functions: &HashMap<String, Vec<String>>,
     call_graph: &flow::CallGraph,
@@ -381,7 +447,7 @@ fn compute_call_cohesion(
     call_cohesion_map
 }
 
-/// Compute type cohesion: fraction of functions sharing parameter/return types within a module.
+/// Compute type cohesion: fraction of functions sharing signature type tokens within a module.
 fn compute_type_cohesion(
     module_func_infos: &HashMap<String, Vec<&ast_parser::FunctionInfo>>,
 ) -> HashMap<String, f64> {
@@ -394,7 +460,7 @@ fn compute_type_cohesion(
 
         let func_types: Vec<HashSet<String>> = funcs
             .iter()
-            .map(|f| extract_param_types(&f.file, f.line_start, f.line_end))
+            .map(|f| extract_signature_types(&f.file, f.line_start, f.line_end))
             .collect();
 
         let mut sharing_count = 0usize;
@@ -415,30 +481,20 @@ fn compute_type_cohesion(
     type_cohesion_map
 }
 
-/// Compute per-module cohesion metrics.
+/// Compute per-source-module cohesion metrics.
 pub fn compute_cohesion(rs_files: &[PathBuf], project_path: &Path) -> Vec<ModuleCohesion> {
     let call_graph = flow::build_call_graph(rs_files, project_path);
     let symbols = ast_parser::parse_project(rs_files);
 
     let mut module_functions: HashMap<String, Vec<String>> = HashMap::new();
-    for func_name in &call_graph.functions {
-        let module = if let Some(pos) = func_name.rfind("::") {
-            func_name[..pos].to_string()
-        } else {
-            "main".to_string()
-        };
-        module_functions
-            .entry(module)
-            .or_default()
-            .push(func_name.clone());
-    }
-
-    let call_cohesion_map = compute_call_cohesion(&module_functions, &call_graph);
-
     let mut module_func_infos: HashMap<String, Vec<&ast_parser::FunctionInfo>> = HashMap::new();
     for file_syms in &symbols.files {
         let module_name = crate_render::module_name_from_path(&file_syms.path, project_path);
         for func in &file_syms.functions {
+            module_functions
+                .entry(module_name.clone())
+                .or_default()
+                .push(function_graph_name(&module_name, &func.name));
             module_func_infos
                 .entry(module_name.clone())
                 .or_default()
@@ -446,31 +502,21 @@ pub fn compute_cohesion(rs_files: &[PathBuf], project_path: &Path) -> Vec<Module
         }
     }
 
+    let call_cohesion_map = compute_call_cohesion(&module_functions, &call_graph);
     let type_cohesion_map = compute_type_cohesion(&module_func_infos);
 
-    let all_modules: HashSet<&str> = module_functions
-        .keys()
-        .map(|s| s.as_str())
-        .chain(module_func_infos.keys().map(|s| s.as_str()))
-        .collect();
-
-    let mut results: Vec<ModuleCohesion> = all_modules
+    let mut results: Vec<ModuleCohesion> = module_func_infos
         .iter()
-        .map(|&module| {
+        .map(|(module, funcs)| {
             let call_c = call_cohesion_map.get(module).copied().unwrap_or(0.0);
             let type_c = type_cohesion_map.get(module).copied().unwrap_or(0.0);
-            let func_count = module_functions
-                .get(module)
-                .map(|v| v.len())
-                .or_else(|| module_func_infos.get(module).map(|v| v.len()))
-                .unwrap_or(0);
             let combined = (0.6 * call_c + 0.4 * type_c).clamp(0.0, 1.0);
             ModuleCohesion {
-                module: module.to_string(),
+                module: module.clone(),
                 call_cohesion: call_c,
                 type_cohesion: type_c,
                 combined,
-                function_count: func_count,
+                function_count: funcs.len(),
             }
         })
         .collect();
@@ -479,12 +525,13 @@ pub fn compute_cohesion(rs_files: &[PathBuf], project_path: &Path) -> Vec<Module
         a.combined
             .partial_cmp(&b.combined)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.module.cmp(&b.module))
     });
     results
 }
 
-/// Extract parameter/return type names from a function in a source file.
-fn extract_param_types(file: &Path, line_start: usize, line_end: usize) -> HashSet<String> {
+/// Extract parameter/return type-like tokens from a function signature in a source file.
+fn extract_signature_types(file: &Path, line_start: usize, line_end: usize) -> HashSet<String> {
     let content = match std::fs::read_to_string(file) {
         Ok(c) => c,
         Err(_) => return HashSet::new(),
@@ -492,10 +539,14 @@ fn extract_param_types(file: &Path, line_start: usize, line_end: usize) -> HashS
     let lines: Vec<&str> = content.lines().collect();
     let start = line_start.saturating_sub(1);
     let end = line_end.min(lines.len());
-    let sig_text: String = lines[start..end].join("\n");
+    let span_text: String = lines[start..end].join("\n");
+    let signature_text = span_text
+        .split_once('{')
+        .map(|(signature, _)| signature)
+        .unwrap_or(&span_text);
 
     let mut types = HashSet::new();
-    for token in sig_text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+    for token in signature_text.split(|c: char| !c.is_alphanumeric() && c != '_') {
         let t = token.trim();
         if t.is_empty() || t.len() < 2 {
             continue;

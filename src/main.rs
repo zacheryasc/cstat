@@ -1,27 +1,16 @@
 mod ast_parser;
 mod call_trace;
-mod circuits;
 mod cluster;
 mod complexity;
 mod coverage;
 mod datapaths;
 mod dead_code;
 mod deps;
-mod diagnostics;
 mod discovery;
-mod dist;
-mod dump;
 mod file_metrics;
-mod file_summary;
 mod flow;
-mod graph;
-mod guide;
 mod loc;
-mod map;
-mod redundancy;
 mod render;
-mod report;
-mod summary;
 mod symbols;
 
 use clap::{Parser, Subcommand};
@@ -31,7 +20,7 @@ use std::path::PathBuf;
 #[command(name = "cstat", about = "Rust codebase complexity analyzer")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 
     /// Rust project directory or Rust source file to analyze (defaults to current directory)
     #[arg(long, default_value = ".", global = true)]
@@ -52,10 +41,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Focused module metrics report (default)
-    Summary,
-    /// Alias for the focused module metrics report
-    Report,
     #[command(
         about = "Lines-of-code size-shape analysis",
         long_about = r#"Lines-of-code size-shape analysis for Rust source.
@@ -123,66 +108,6 @@ Use --explain to print this usage and JSON field contract without running analys
     },
     /// Value-cluster transcript from AST def-use structure.
     Cluster,
-    /// Opt-in legacy and exploratory analyses
-    Advanced {
-        #[command(subcommand)]
-        command: AdvancedCommands,
-    },
-}
-
-#[derive(Subcommand)]
-enum AdvancedCommands {
-    /// Previous broad dashboard overview
-    Summary,
-    /// Bird's eye module map — architectural overview
-    Map,
-    /// Static call graph / execution flow analysis
-    Flow,
-    /// Graph-theoretic analysis (SCCs, centrality, PageRank, clustering)
-    Graph {
-        /// Analyze only the call graph
-        #[arg(long)]
-        call_only: bool,
-        /// Analyze only the module dependency graph
-        #[arg(long)]
-        dep_only: bool,
-        /// Show only the top N nodes per metric
-        #[arg(long, default_value = "10")]
-        top: usize,
-    },
-    /// Previous random-walk execution flow heatmap
-    FlowHeatmap {
-        /// Number of random walks to simulate
-        #[arg(long, default_value = "10000")]
-        walks: usize,
-        /// Start from a specific function instead of all entry points
-        #[arg(long, name = "FUNCTION")]
-        from: Option<String>,
-    },
-    /// Distribution visualizations (histograms, scatter, outliers, correlations)
-    Dist {
-        /// Show only a single metric (loc, cyclomatic, cognitive, nesting, params)
-        #[arg(long)]
-        metric: Option<String>,
-        /// Number of histogram bins
-        #[arg(long, default_value = "10")]
-        bins: usize,
-    },
-    /// Functional cluster decomposition via community detection
-    Circuits {
-        /// Minimum circuit size to display
-        #[arg(long, default_value = "1")]
-        min_size: usize,
-    },
-    /// Detect suspected duplicate or near-duplicate functions
-    Redundancy,
-    /// Machine-readable diagnostic summary (always JSON)
-    Dump,
-    /// Code health reference — topic-based workflow and metric guide
-    Guide {
-        /// Topic to display (e.g. getting-started, size, complexity, modularity, flow, redundancy, architecture)
-        topic: Option<String>,
-    },
 }
 
 fn main() {
@@ -195,12 +120,13 @@ fn main() {
     }
 
     let verbose = cli.verbose;
-    let command = cli.command.unwrap_or(Commands::Summary);
+    let command = cli.command;
 
     if let Commands::Loc { explain: true, .. } = &command {
         loc::render_loc_explain(json);
         return;
     }
+
     let target = match discovery::resolve_target(&cli.path) {
         Ok(target) => target,
         Err(e) => {
@@ -220,18 +146,6 @@ fn main() {
         let project_rs_files = discovery::files_for_project(&target);
         let target_rs_files = discovery::files_for_target(&target);
         match command {
-            Commands::Summary | Commands::Report => {
-                if json {
-                    file_summary::render_file_summary_json(project_rs_files, project_path, file);
-                } else {
-                    file_summary::render_file_summary(
-                        project_rs_files,
-                        project_path,
-                        file,
-                        verbose,
-                    );
-                }
-            }
             Commands::Loc { .. } => {
                 if json {
                     loc::render_loc_file_json(project_rs_files, project_path, file);
@@ -317,6 +231,7 @@ fn main() {
                     Some(file),
                     no_run,
                     json,
+                    verbose,
                 ) {
                     if json {
                         let err = serde_json::json!({"error": message});
@@ -327,29 +242,11 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-            Commands::Advanced { .. } => {
-                let message =
-                    "advanced commands require a project directory; pass --path <crate-dir>";
-                if json {
-                    let err = serde_json::json!({"error": message});
-                    println!("{}", serde_json::to_string(&err).unwrap());
-                } else {
-                    eprintln!("Error: {}", message);
-                }
-                std::process::exit(1);
-            }
         }
         return;
     }
 
     match command {
-        Commands::Summary | Commands::Report => {
-            if json {
-                report::render_report_json(&rs_files, &project_path);
-            } else {
-                report::render_report(&rs_files, &project_path, verbose);
-            }
-        }
         Commands::Loc { top, .. } => {
             if json {
                 loc::render_loc_json(&rs_files, &project_path);
@@ -412,7 +309,7 @@ fn main() {
         }
         Commands::Coverage { no_run } => {
             if let Err(message) =
-                coverage::render_coverage(&rs_files, &project_path, None, no_run, json)
+                coverage::render_coverage(&rs_files, &project_path, None, no_run, json, verbose)
             {
                 if json {
                     let err = serde_json::json!({"error": message});
@@ -423,93 +320,5 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Advanced { command } => match command {
-            AdvancedCommands::Summary => {
-                if json {
-                    summary::render_summary_json(&rs_files, &project_path);
-                } else {
-                    summary::render_summary(&rs_files, &project_path, verbose);
-                }
-            }
-            AdvancedCommands::Map => {
-                if json {
-                    map::render_map_json(&rs_files, &project_path);
-                } else {
-                    map::render_map(&rs_files, &project_path, verbose);
-                }
-            }
-            AdvancedCommands::Flow => {
-                if json {
-                    flow::render_flow_json(&rs_files, &project_path);
-                } else {
-                    flow::render_flow(&rs_files, &project_path, verbose);
-                }
-            }
-            AdvancedCommands::Graph {
-                call_only,
-                dep_only,
-                top,
-            } => {
-                if json {
-                    graph::render_graph_json(&rs_files, &project_path, call_only, dep_only);
-                } else {
-                    graph::render_graph(
-                        &rs_files,
-                        &project_path,
-                        call_only,
-                        dep_only,
-                        top,
-                        verbose,
-                    );
-                }
-            }
-            AdvancedCommands::FlowHeatmap { walks, from } => {
-                if json {
-                    datapaths::render_datapaths_json(
-                        &rs_files,
-                        &project_path,
-                        walks,
-                        from.as_deref(),
-                    );
-                } else {
-                    datapaths::render_datapaths(
-                        &rs_files,
-                        &project_path,
-                        walks,
-                        from.as_deref(),
-                        verbose,
-                    );
-                }
-            }
-            AdvancedCommands::Dist { metric, bins } => {
-                if json {
-                    dist::render_dist_json(&rs_files, &project_path, metric.as_deref(), bins);
-                } else {
-                    dist::render_dist(&rs_files, &project_path, metric.as_deref(), bins, verbose);
-                }
-            }
-            AdvancedCommands::Circuits { min_size } => {
-                if json {
-                    circuits::render_circuits_json(&rs_files, &project_path, min_size);
-                } else {
-                    circuits::render_circuits(&rs_files, &project_path, min_size, verbose);
-                }
-            }
-            AdvancedCommands::Redundancy => {
-                if json {
-                    redundancy::render_redundancy_json(&rs_files, &project_path);
-                } else {
-                    redundancy::render_redundancy(&rs_files, &project_path, verbose);
-                }
-            }
-            AdvancedCommands::Dump => {
-                colored::control::set_override(false);
-                dump::render_dump(&rs_files, &project_path);
-            }
-            AdvancedCommands::Guide { topic } => match topic {
-                Some(t) => guide::render_guide_topic(&t, json),
-                None => guide::render_guide_toc(json),
-            },
-        },
     }
 }
