@@ -11,6 +11,7 @@ mod file_metrics;
 mod flow;
 mod loc;
 mod render;
+mod scorecard;
 mod symbols;
 
 use clap::{Parser, Subcommand};
@@ -84,6 +85,12 @@ Use --explain to print this usage and JSON field contract without running analys
     Signature,
     /// Function implementation span rankings
     Span,
+    /// Deterministic structural code complexity scorecard
+    Scorecard {
+        /// Show only the top N contributors
+        #[arg(long)]
+        top: Option<usize>,
+    },
     /// Module dependency connectome
     Deps {
         /// Show only the top N most connected modules
@@ -175,6 +182,16 @@ fn main() {
                 } else {
                     cluster::render_cluster_file(project_rs_files, project_path, file, verbose);
                 }
+            }
+            Commands::Scorecard { top } => {
+                scorecard::render_scorecard(
+                    target_rs_files,
+                    project_path,
+                    &cli.path.display().to_string(),
+                    top,
+                    json,
+                    verbose,
+                );
             }
             Commands::Deps { .. } => {
                 if json {
@@ -269,6 +286,16 @@ fn main() {
         }
         Commands::Span => {
             complexity::run_span(&rs_files, &project_path, json, verbose);
+        }
+        Commands::Scorecard { top } => {
+            scorecard::render_scorecard(
+                &rs_files,
+                &project_path,
+                &cli.path.display().to_string(),
+                top,
+                json,
+                verbose,
+            );
         }
         Commands::Cluster => {
             cluster::render_cluster(&rs_files, &project_path, json, verbose);

@@ -12,6 +12,7 @@ and tests preserve behavior.
 Start with the focused commands that answer the current cleanup question:
 
 ```sh
+cstat scorecard --json --path <project_root>
 cstat loc --json --path <project_root>
 cstat symbols --json --path <project_root>
 cstat deps --json --path <project_root>
@@ -41,6 +42,8 @@ Each accepts `--json` for structured output.
 - `cstat branching --json --path .` — per-function decision/path complexity.
 - `cstat signature --json --path .` — per-function API boundary complexity.
 - `cstat span --json --path .` — per-function implementation span metrics.
+- `cstat scorecard --json --path .` — deterministic structural complexity cost
+  for agent optimization, with component costs, scope breakdown, and hotspots.
 
 
 ## Cleanup workflow
