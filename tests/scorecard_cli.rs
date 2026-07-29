@@ -95,7 +95,7 @@ fn branchy(input: usize) -> usize {
 
     let value = score(&root);
     assert_eq!(value["cstat_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(value["score_version"], "code_complexity_cost_v0");
+    assert_eq!(value["score_version"], "code_complexity_cost_v1");
     for field in [
         "target",
         "code_complexity_cost",
@@ -110,6 +110,10 @@ fn branchy(input: usize) -> usize {
     assert!(
         value["component_costs"].get("verification_gap").is_none(),
         "scorecard must not mix harness verification into code complexity: {value}",
+    );
+    assert!(
+        value["component_costs"].get("api_surface").is_some(),
+        "scorecard should expose API surface component: {value}",
     );
     for scope in ["production", "tests", "benches"] {
         assert!(
@@ -134,9 +138,10 @@ fn branchy(input: usize) -> usize {
     let stdout = String::from_utf8_lossy(&human.stdout);
     for expected in [
         "Code complexity score",
-        "score version: code_complexity_cost_v0",
+        "score version: code_complexity_cost_v1",
         "lower is cleaner; harness guards behavior separately",
         "components:",
+        "api surface:",
         "top contributors:",
     ] {
         assert!(stdout.contains(expected), "missing {expected}: {stdout}");
@@ -369,6 +374,64 @@ pub fn touch() {
     assert!(
         total(&after) > total(&before),
         "coupling fixture should increase total cost: before={before} after={after}",
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn widening_visibility_increases_api_surface_cost() {
+    let root = temp_project("api-surface");
+    write_main(
+        &root,
+        r#"fn main() {
+    println!("{}", exposed(1));
+}
+
+fn exposed(input: usize) -> usize {
+    input + 1
+}
+"#,
+    );
+    let private_score = score(&root);
+
+    write_main(
+        &root,
+        r#"fn main() {
+    println!("{}", exposed(1));
+}
+
+pub(crate) fn exposed(input: usize) -> usize {
+    input + 1
+}
+"#,
+    );
+    let crate_score = score(&root);
+
+    write_main(
+        &root,
+        r#"fn main() {
+    println!("{}", exposed(1));
+}
+
+pub fn exposed(input: usize) -> usize {
+    input + 1
+}
+"#,
+    );
+    let public_score = score(&root);
+
+    assert!(
+        component(&crate_score, "api_surface") > component(&private_score, "api_surface"),
+        "pub(crate) visibility should add API surface cost: private={private_score} crate={crate_score}",
+    );
+    assert!(
+        component(&public_score, "api_surface") > component(&crate_score, "api_surface"),
+        "pub visibility should cost more than pub(crate): crate={crate_score} public={public_score}",
+    );
+    assert!(
+        total(&public_score) > total(&private_score),
+        "widening visibility should increase total score: private={private_score} public={public_score}",
     );
 
     fs::remove_dir_all(root).unwrap();

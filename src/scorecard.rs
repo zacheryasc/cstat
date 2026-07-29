@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{ast_parser, dead_code, deps, flow, loc, render};
 
-const SCORE_VERSION: &str = "code_complexity_cost_v0";
+const SCORE_VERSION: &str = "code_complexity_cost_v1";
 const DEFAULT_TOP: usize = 20;
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +28,7 @@ pub struct ComponentCosts {
     pub file_concentration: FileComponent,
     pub module_coupling: ModuleComponent,
     pub abstraction_surface: AbstractionComponent,
+    pub api_surface: ApiSurfaceComponent,
     pub stale_surface: StaleComponent,
 }
 
@@ -56,6 +57,13 @@ pub struct AbstractionComponent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ApiSurfaceComponent {
+    pub cost: f64,
+    pub public_symbols: usize,
+    pub crate_symbols: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StaleComponent {
     pub cost: f64,
     pub candidate_count: usize,
@@ -78,6 +86,8 @@ pub struct TopContributor {
     pub module: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
     pub cost: f64,
     pub reasons: BTreeMap<String, serde_json::Value>,
     pub component_costs: BTreeMap<String, f64>,
@@ -104,6 +114,7 @@ struct Contributor {
     file: Option<String>,
     module: Option<String>,
     function: Option<String>,
+    symbol: Option<String>,
     cost: f64,
     reasons: BTreeMap<String, serde_json::Value>,
     component_costs: BTreeMap<String, f64>,
@@ -120,6 +131,7 @@ struct FunctionScoreInput {
     line_count: usize,
     body_stmt_count: usize,
     signature_score: usize,
+    visibility: ast_parser::ApiVisibility,
 }
 
 pub fn render_scorecard(
@@ -170,6 +182,14 @@ pub fn analyze_scorecard(
         &mut scope_totals,
         &mut contributors,
     );
+    let api_surface = score_api_surface(
+        &symbols,
+        &function_inputs,
+        project_path,
+        &file_scopes,
+        &mut scope_totals,
+        &mut contributors,
+    );
     let module_coupling = score_module_coupling(
         files,
         project_path,
@@ -192,6 +212,7 @@ pub fn analyze_scorecard(
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.module.cmp(&b.module))
             .then_with(|| a.function.cmp(&b.function))
+            .then_with(|| a.symbol.cmp(&b.symbol))
     });
     contributors.truncate(top);
 
@@ -200,6 +221,7 @@ pub fn analyze_scorecard(
         + file_concentration.cost
         + module_coupling.cost
         + abstraction_surface.cost
+        + api_surface.cost
         + stale_surface.cost;
     let kloc = (code_lines as f64 / 1000.0).max(1.0);
 
@@ -226,6 +248,11 @@ pub fn analyze_scorecard(
                 cost: round1(abstraction_surface.cost),
                 symbols_scored: abstraction_surface.symbols_scored,
             },
+            api_surface: ApiSurfaceComponent {
+                cost: round1(api_surface.cost),
+                public_symbols: api_surface.public_symbols,
+                crate_symbols: api_surface.crate_symbols,
+            },
             stale_surface: StaleComponent {
                 cost: round1(stale_surface.cost),
                 candidate_count: stale_surface.candidate_count,
@@ -240,6 +267,7 @@ pub fn analyze_scorecard(
                 file: contributor.file,
                 module: contributor.module,
                 function: contributor.function,
+                symbol: contributor.symbol,
                 cost: round1(contributor.cost),
                 reasons: contributor.reasons,
                 component_costs: contributor
@@ -293,6 +321,10 @@ fn render_scorecard_human(report: &ScorecardReport, verbose: bool) {
     );
     println!(
         "  {:<24} {:>8.1}",
+        "api surface:", report.component_costs.api_surface.cost
+    );
+    println!(
+        "  {:<24} {:>8.1}",
         "stale surface:", report.component_costs.stale_surface.cost
     );
 
@@ -326,6 +358,13 @@ fn contributor_label(contributor: &TopContributor) -> String {
             .file
             .clone()
             .unwrap_or_else(|| "<unknown>".to_string()),
+        "api_surface" => match (&contributor.file, &contributor.symbol) {
+            (Some(file), Some(symbol)) => format!("{file}::{symbol}"),
+            _ => contributor
+                .symbol
+                .clone()
+                .unwrap_or_else(|| "<unknown>".to_string()),
+        },
         "module" => contributor
             .module
             .clone()
@@ -360,6 +399,13 @@ struct ModuleScoreSummary {
 struct AbstractionScoreSummary {
     cost: f64,
     symbols_scored: usize,
+}
+
+#[derive(Default)]
+struct ApiSurfaceScoreSummary {
+    cost: f64,
+    public_symbols: usize,
+    crate_symbols: usize,
 }
 
 #[derive(Default)]
@@ -416,6 +462,7 @@ fn score_functions(
                 file: Some(function.file.clone()),
                 module: None,
                 function: Some(function.function.clone()),
+                symbol: None,
                 cost,
                 reasons,
                 component_costs,
@@ -475,6 +522,7 @@ fn score_files(
                 file: Some(relative_file(&file.path, project_path)),
                 module: None,
                 function: None,
+                symbol: None,
                 cost,
                 reasons,
                 component_costs,
@@ -541,6 +589,7 @@ fn score_abstraction_surface(
                 file: Some(relative_file(&file.path, project_path)),
                 module: None,
                 function: None,
+                symbol: None,
                 cost,
                 reasons,
                 component_costs,
@@ -549,6 +598,196 @@ fn score_abstraction_surface(
     }
 
     summary
+}
+
+fn score_api_surface(
+    symbols: &ast_parser::ProjectSymbols,
+    functions: &[FunctionScoreInput],
+    project_path: &Path,
+    file_scopes: &HashMap<PathBuf, String>,
+    scopes: &mut BTreeMap<String, ScopeAccumulator>,
+    contributors: &mut Vec<Contributor>,
+) -> ApiSurfaceScoreSummary {
+    let mut summary = ApiSurfaceScoreSummary::default();
+
+    for function in functions {
+        score_api_symbol(
+            ApiSymbolInput {
+                symbol_kind: "function",
+                file: &function.file,
+                symbol: &function.function,
+                scope: &function.scope,
+                visibility: function.visibility,
+                kind_weight: 1.0,
+                signature_score: Some(function.signature_score),
+            },
+            &mut summary,
+            scopes,
+            contributors,
+        );
+    }
+
+    for file in &symbols.files {
+        let rel_file = relative_file(&file.path, project_path);
+        let scope = file_scopes
+            .get(&file.path)
+            .cloned()
+            .unwrap_or_else(|| file_scope(&file.path, project_path));
+
+        for item in &file.structs {
+            score_api_symbol(
+                ApiSymbolInput {
+                    symbol_kind: "struct",
+                    file: &rel_file,
+                    symbol: &item.name,
+                    scope: &scope,
+                    visibility: item.visibility,
+                    kind_weight: 1.0,
+                    signature_score: None,
+                },
+                &mut summary,
+                scopes,
+                contributors,
+            );
+        }
+        for item in &file.enums {
+            score_api_symbol(
+                ApiSymbolInput {
+                    symbol_kind: "enum",
+                    file: &rel_file,
+                    symbol: &item.name,
+                    scope: &scope,
+                    visibility: item.visibility,
+                    kind_weight: 1.0,
+                    signature_score: None,
+                },
+                &mut summary,
+                scopes,
+                contributors,
+            );
+        }
+        for item in &file.traits {
+            score_api_symbol(
+                ApiSymbolInput {
+                    symbol_kind: "trait",
+                    file: &rel_file,
+                    symbol: &item.name,
+                    scope: &scope,
+                    visibility: item.visibility,
+                    kind_weight: 2.0,
+                    signature_score: None,
+                },
+                &mut summary,
+                scopes,
+                contributors,
+            );
+        }
+        for item in &file.consts {
+            score_api_symbol(
+                ApiSymbolInput {
+                    symbol_kind: "const",
+                    file: &rel_file,
+                    symbol: &item.name,
+                    scope: &scope,
+                    visibility: item.visibility,
+                    kind_weight: 0.5,
+                    signature_score: None,
+                },
+                &mut summary,
+                scopes,
+                contributors,
+            );
+        }
+        for item in &file.statics {
+            score_api_symbol(
+                ApiSymbolInput {
+                    symbol_kind: "static",
+                    file: &rel_file,
+                    symbol: &item.name,
+                    scope: &scope,
+                    visibility: item.visibility,
+                    kind_weight: 0.5,
+                    signature_score: None,
+                },
+                &mut summary,
+                scopes,
+                contributors,
+            );
+        }
+    }
+
+    summary
+}
+
+struct ApiSymbolInput<'a> {
+    symbol_kind: &'static str,
+    file: &'a str,
+    symbol: &'a str,
+    scope: &'a str,
+    visibility: ast_parser::ApiVisibility,
+    kind_weight: f64,
+    signature_score: Option<usize>,
+}
+
+fn score_api_symbol(
+    input: ApiSymbolInput<'_>,
+    summary: &mut ApiSurfaceScoreSummary,
+    scopes: &mut BTreeMap<String, ScopeAccumulator>,
+    contributors: &mut Vec<Contributor>,
+) {
+    let Some((visibility, visibility_weight)) = api_visibility_weight(input.visibility) else {
+        return;
+    };
+
+    match input.visibility {
+        ast_parser::ApiVisibility::Public => summary.public_symbols += 1,
+        ast_parser::ApiVisibility::Crate => summary.crate_symbols += 1,
+        ast_parser::ApiVisibility::Private => {}
+    }
+
+    let visibility_surface_cost = visibility_weight * input.kind_weight;
+    let signature_surface_cost = input
+        .signature_score
+        .map(|score| visibility_weight * 0.5 * excess(score, 3))
+        .unwrap_or(0.0);
+    let cost = visibility_surface_cost + signature_surface_cost;
+
+    summary.cost += cost;
+    add_scope_cost(scopes, input.scope, cost);
+
+    let mut reasons = BTreeMap::new();
+    reasons.insert("visibility".to_string(), json!(visibility));
+    reasons.insert("symbol_kind".to_string(), json!(input.symbol_kind));
+    reasons.insert("symbol".to_string(), json!(input.symbol));
+    if let Some(signature_score) = input.signature_score {
+        reasons.insert("signature_score".to_string(), json!(signature_score));
+    }
+
+    let mut component_costs = BTreeMap::new();
+    component_costs.insert("visibility_surface".to_string(), visibility_surface_cost);
+    if signature_surface_cost > 0.0 {
+        component_costs.insert("signature_surface".to_string(), signature_surface_cost);
+    }
+
+    contributors.push(Contributor {
+        kind: "api_surface".to_string(),
+        scope: input.scope.to_string(),
+        file: Some(input.file.to_string()),
+        module: None,
+        function: None,
+        symbol: Some(input.symbol.to_string()),
+        cost,
+        reasons,
+        component_costs,
+    });
+}
+
+fn api_visibility_weight(visibility: ast_parser::ApiVisibility) -> Option<(&'static str, f64)> {
+    match visibility {
+        ast_parser::ApiVisibility::Public => Some(("pub", 1.0)),
+        ast_parser::ApiVisibility::Crate => Some(("pub(crate)", 0.4)),
+        ast_parser::ApiVisibility::Private => None,
+    }
 }
 
 fn score_module_coupling(
@@ -595,6 +834,7 @@ fn score_module_coupling(
                 file: None,
                 module: Some(module.clone()),
                 function: None,
+                symbol: None,
                 cost,
                 reasons,
                 component_costs,
@@ -624,6 +864,7 @@ fn score_module_coupling(
             file: None,
             module: Some(format!("{module_a} <-> {module_b}")),
             function: None,
+            symbol: None,
             cost,
             reasons,
             component_costs,
@@ -657,6 +898,7 @@ fn score_module_coupling(
                 file: None,
                 module: Some(row.module.clone()),
                 function: None,
+                symbol: None,
                 cost,
                 reasons,
                 component_costs,
@@ -709,6 +951,7 @@ fn score_stale_surface(
                 .map(|file| (*file).to_string()),
             module: None,
             function: Some(candidate.function.clone()),
+            symbol: None,
             cost,
             reasons,
             component_costs,
@@ -749,6 +992,7 @@ fn collect_function_inputs(
                 line_count,
                 body_stmt_count: function.body_stmt_count,
                 signature_score,
+                visibility: function.visibility,
             });
         }
     }

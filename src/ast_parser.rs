@@ -5,6 +5,14 @@ use syn::{
     WherePredicate,
 };
 
+/// Rust item visibility bucket used by scorecard API-surface accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiVisibility {
+    Private,
+    Crate,
+    Public,
+}
+
 /// Extracted information about a function (free function or method).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -22,6 +30,7 @@ pub struct FunctionInfo {
     pub line_start: usize,
     pub line_end: usize,
     pub is_test_support: bool,
+    pub visibility: ApiVisibility,
 }
 
 /// Extracted information about a struct.
@@ -33,6 +42,7 @@ pub struct StructInfo {
     pub field_count: usize,
     pub derive_count: usize,
     pub generic_param_count: usize,
+    pub visibility: ApiVisibility,
     pub line_start: usize,
     pub line_end: usize,
 }
@@ -46,6 +56,7 @@ pub struct EnumInfo {
     pub variant_count: usize,
     pub derive_count: usize,
     pub generic_param_count: usize,
+    pub visibility: ApiVisibility,
     pub line_start: usize,
     pub line_end: usize,
 }
@@ -58,6 +69,7 @@ pub struct TraitInfo {
     pub file: PathBuf,
     pub method_count: usize,
     pub generic_param_count: usize,
+    pub visibility: ApiVisibility,
     pub line_start: usize,
     pub line_end: usize,
 }
@@ -68,6 +80,7 @@ pub struct TraitInfo {
 pub struct ConstInfo {
     pub name: String,
     pub file: PathBuf,
+    pub visibility: ApiVisibility,
     pub line_start: usize,
     pub line_end: usize,
 }
@@ -78,6 +91,7 @@ pub struct ConstInfo {
 pub struct StaticInfo {
     pub name: String,
     pub file: PathBuf,
+    pub visibility: ApiVisibility,
     pub line_start: usize,
     pub line_end: usize,
 }
@@ -220,6 +234,7 @@ impl SymbolExtractor {
                     &self.file_path,
                     &func.sig,
                     Some(&func.block),
+                    visibility_from_syn(&func.vis),
                     is_test_support,
                 );
                 self.functions.push(info);
@@ -247,6 +262,7 @@ impl SymbolExtractor {
                     field_count,
                     derive_count,
                     generic_param_count,
+                    visibility: visibility_from_syn(&s.vis),
                     line_start,
                     line_end,
                 });
@@ -260,6 +276,7 @@ impl SymbolExtractor {
                     variant_count: e.variants.len(),
                     derive_count,
                     generic_param_count,
+                    visibility: visibility_from_syn(&e.vis),
                     line_start: e.enum_token.span.start().line,
                     line_end: e.brace_token.span.close().end().line,
                 });
@@ -276,6 +293,7 @@ impl SymbolExtractor {
                     file: self.file_path.clone(),
                     method_count,
                     generic_param_count,
+                    visibility: visibility_from_syn(&t.vis),
                     line_start: t.trait_token.span.start().line,
                     line_end: t.brace_token.span.close().end().line,
                 });
@@ -284,6 +302,7 @@ impl SymbolExtractor {
                 self.consts.push(ConstInfo {
                     name: self.qualify_name(&c.ident.to_string()),
                     file: self.file_path.clone(),
+                    visibility: visibility_from_syn(&c.vis),
                     line_start: c.const_token.span.start().line,
                     line_end: c.semi_token.span.end().line,
                 });
@@ -292,6 +311,7 @@ impl SymbolExtractor {
                 self.statics.push(StaticInfo {
                     name: self.qualify_name(&s.ident.to_string()),
                     file: self.file_path.clone(),
+                    visibility: visibility_from_syn(&s.vis),
                     line_start: s.static_token.span.start().line,
                     line_end: s.semi_token.span.end().line,
                 });
@@ -317,6 +337,7 @@ impl SymbolExtractor {
                             &self.file_path,
                             &method.sig,
                             Some(&method.block),
+                            visibility_from_syn(&method.vis),
                             self.is_test_support_context()
                                 || has_cfg_test_attr(&method.attrs)
                                 || has_cfg_test_attr(&imp.attrs),
@@ -370,6 +391,7 @@ fn extract_function_info(
     file: &Path,
     sig: &syn::Signature,
     body: Option<&syn::Block>,
+    visibility: ApiVisibility,
     is_test_support: bool,
 ) -> FunctionInfo {
     let param_count = sig.inputs.len();
@@ -413,6 +435,7 @@ fn extract_function_info(
         trait_bound_count,
         where_predicate_count,
         return_type_complexity,
+        visibility,
         line_start,
         line_end,
         is_test_support,
@@ -422,6 +445,16 @@ fn extract_function_info(
 /// Count derives from attributes.
 fn count_derives(attrs: &[syn::Attribute]) -> usize {
     attrs.iter().filter(|a| a.path().is_ident("derive")).count()
+}
+
+fn visibility_from_syn(vis: &syn::Visibility) -> ApiVisibility {
+    match vis {
+        syn::Visibility::Public(_) => ApiVisibility::Public,
+        syn::Visibility::Restricted(restricted) if restricted.path.is_ident("crate") => {
+            ApiVisibility::Crate
+        }
+        _ => ApiVisibility::Private,
+    }
 }
 
 fn has_cfg_test_attr(attrs: &[syn::Attribute]) -> bool {
