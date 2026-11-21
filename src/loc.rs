@@ -1,7 +1,10 @@
 use colored::Colorize;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use crate::{ast_parser, datapaths, file_metrics, flow, render};
 /// Per-file line count data.
@@ -108,13 +111,11 @@ fn classify_line(trimmed: &str, in_block_comment: bool) -> (bool, bool) {
     (true, false)
 }
 
-/// Count lines in a single file. Code lines exclude blank lines and comment-only lines.
-pub fn count_file_lines(path: &Path) -> Option<FileLocStats> {
-    let content = std::fs::read_to_string(path).ok()?;
+/// Classify and count total/code lines over an in-memory string.
+fn count_string_lines(content: &str) -> (usize, usize) {
     let total_lines = content.lines().count();
     let mut code_lines = 0usize;
     let mut in_block_comment = false;
-
     for line in content.lines() {
         let (is_code, new_in_block) = classify_line(line.trim(), in_block_comment);
         in_block_comment = new_in_block;
@@ -122,7 +123,17 @@ pub fn count_file_lines(path: &Path) -> Option<FileLocStats> {
             code_lines += 1;
         }
     }
+    (total_lines, code_lines)
+}
 
+/// Raw textual line count of a file, with no rustfmt normalization.
+///
+/// Used by projected-line reachability, whose spans are real source line numbers
+/// tied to static reachability and coverage — normalizing there would desync the
+/// reported spans from the reported line counts.
+fn count_raw_lines(path: &Path) -> Option<FileLocStats> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let (total_lines, code_lines) = count_string_lines(&content);
     Some(FileLocStats {
         path: path.to_path_buf(),
         total_lines,
@@ -130,8 +141,169 @@ pub fn count_file_lines(path: &Path) -> Option<FileLocStats> {
     })
 }
 
-fn count_lines(path: &Path) -> Option<FileLocStats> {
-    count_file_lines(path)
+/// Count lines in a single file, rustfmt-normalized first so line-packed source
+/// cannot deflate LOC. Formats a temp copy of this one file; the working tree is
+/// never modified. Falls back to raw counting when rustfmt is unavailable or the
+/// file fails to format.
+pub fn count_file_lines(path: &Path) -> Option<FileLocStats> {
+    let key = path.to_path_buf();
+    let mut map = count_file_lines_batch(std::slice::from_ref(&key));
+    map.remove(&key)
+}
+
+/// Detect the Rust edition for `file` from the nearest ancestor `Cargo.toml`,
+/// memoized per manifest. Defaults to "2021" when no manifest or edition key is
+/// found. A wrong guess only causes a rustfmt parse failure, which falls back to
+/// raw counting — so the worst case is losing normalization on that one file.
+fn rustfmt_edition_for(file: &Path) -> String {
+    static CACHE: LazyLock<Mutex<HashMap<PathBuf, String>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        let cargo = d.join("Cargo.toml");
+        if cargo.is_file() {
+            if let Some(e) = CACHE.lock().ok().and_then(|g| g.get(&cargo).cloned()) {
+                return e;
+            }
+            let e = read_edition(&cargo).unwrap_or_else(|| "2021".to_string());
+            if let Ok(mut guard) = CACHE.lock() {
+                guard.insert(cargo.clone(), e.clone());
+            }
+            return e;
+        }
+        dir = d.parent();
+    }
+    "2021".to_string()
+}
+
+/// Scan a `Cargo.toml` for an `edition = "YYYY"` line (2015/2018/2021/2024).
+fn read_edition(cargo: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(cargo).ok()?;
+    for line in text.lines() {
+        let t = line.trim();
+        let rest = t.strip_prefix("edition")?.trim_start();
+        let rest = rest.strip_prefix('=')?.trim();
+        let v = rest.trim_matches('"');
+        if matches!(v, "2015" | "2018" | "2021" | "2024") {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Create a unique temp directory for rustfmt copies.
+fn make_temp_dir() -> Option<PathBuf> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("cstat-fmt-{}-{}", std::process::id(), n));
+    std::fs::create_dir_all(&dir).ok().map(|_| dir)
+}
+
+/// Count lines for every file, rustfmt-normalizing them first.
+///
+/// All measured files are copied into one temp directory and formatted in a
+/// SINGLE `rustfmt` invocation (chunked only to bound argument length), so the
+/// cost is roughly constant in file count rather than one spawn per file. The
+/// working tree is never modified: counts come from the temp copies, removed
+/// afterward.
+///
+/// rustfmt leaves any file it cannot parse as its original copy, so unreadable
+/// or edition-mismatched files automatically fall back to raw textual counting.
+/// If rustfmt is missing or the temp directory cannot be created, every file
+/// falls back to raw counting.
+pub fn count_file_lines_batch(files: &[PathBuf]) -> HashMap<PathBuf, FileLocStats> {
+    let mut out: HashMap<PathBuf, FileLocStats> = HashMap::new();
+    if files.is_empty() {
+        return out;
+    }
+
+    // Read every source into memory (None == unreadable / non-UTF-8).
+    let sources: Vec<Option<String>> = files.iter().map(|f| std::fs::read_to_string(f).ok()).collect();
+
+    let tmp_dir = match make_temp_dir() {
+        Some(d) => d,
+        None => {
+            for (file, content) in files.iter().zip(sources.iter()) {
+                if let Some(c) = content {
+                    let (t, cl) = count_string_lines(c);
+                    out.insert(
+                        file.clone(),
+                        FileLocStats {
+                            path: file.clone(),
+                            total_lines: t,
+                            code_lines: cl,
+                        },
+                    );
+                }
+            }
+            return out;
+        }
+    };
+
+    // Copy each readable file into the temp dir, keyed by index.
+    let edition = rustfmt_edition_for(&files[0]);
+    let mut tmp_paths: HashMap<usize, PathBuf> = HashMap::new();
+    for (i, content) in sources.iter().enumerate() {
+        if let Some(c) = content {
+            let tmp = tmp_dir.join(format!("{i}.rs"));
+            if std::fs::write(&tmp, c).is_ok() {
+                tmp_paths.insert(i, tmp);
+            }
+        }
+    }
+
+    // Format all copies. Chunk to keep the argument list well under ARG_MAX.
+    let all_tmp: Vec<PathBuf> = tmp_paths.values().cloned().collect();
+    const CHUNK: usize = 512;
+    for chunk in all_tmp.chunks(CHUNK) {
+        let mut cmd = Command::new("rustfmt");
+        cmd.arg("--edition").arg(&edition);
+        for tmp in chunk {
+            cmd.arg(tmp);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Exit status is intentionally ignored: rustfmt formats the files it can
+        // and leaves unparseable ones as their original copy (raw fallback).
+        let _ = cmd.status();
+    }
+
+    // Count from the (now possibly formatted) temp copies.
+    for (i, file) in files.iter().enumerate() {
+        let counted = match tmp_paths.get(&i) {
+            Some(tmp) => match std::fs::read_to_string(tmp) {
+                Ok(formatted) => {
+                    let (t, cl) = count_string_lines(&formatted);
+                    FileLocStats {
+                        path: file.clone(),
+                        total_lines: t,
+                        code_lines: cl,
+                    }
+                }
+                // Temp copy unreadable: fall back to the original source.
+                Err(_) => match &sources[i] {
+                    Some(c) => {
+                        let (t, cl) = count_string_lines(c);
+                        FileLocStats {
+                            path: file.clone(),
+                            total_lines: t,
+                            code_lines: cl,
+                        }
+                    }
+                    None => continue,
+                },
+            },
+            // No temp copy was written (source unreadable): skip, matching the
+            // old behavior of dropping unreadable files.
+            None => continue,
+        };
+        out.insert(file.clone(), counted);
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    out
 }
 
 fn code_lines_in_spans(path: &Path, spans: &[(usize, usize)]) -> HashSet<usize> {
@@ -172,7 +344,7 @@ pub fn analyze_file_projected_line_reachability(
     reachable_functions: &HashSet<String>,
     file_display_path: &str,
 ) -> Option<FileProjectedLineReachabilityReport> {
-    let file_stats = count_file_lines(file)?;
+    let file_stats = count_raw_lines(file)?;
     let mut reachable_spans = Vec::new();
     let mut unreachable_spans = Vec::new();
     let mut production_ranges = Vec::new();
@@ -219,7 +391,8 @@ pub fn analyze_file_projected_line_reachability(
 
 /// Count lines for all files and compute aggregate statistics.
 pub fn analyze_files(files: &[PathBuf]) -> (Vec<FileLocStats>, Option<AggregateStats>) {
-    let mut file_stats: Vec<FileLocStats> = files.iter().filter_map(|f| count_lines(f)).collect();
+    let stats = count_file_lines_batch(files);
+    let mut file_stats: Vec<FileLocStats> = files.iter().filter_map(|f| stats.get(f).cloned()).collect();
 
     // Sort descending by code lines
     file_stats.sort_by(|a, b| b.code_lines.cmp(&a.code_lines));
@@ -498,6 +671,9 @@ fn render_loc_explain_human() {
     println!("  code_lines: static textual classification");
     println!("    excludes blank lines, // comment-only lines, and block-comment-only regions");
     println!("    not semantic Rust parsing");
+    println!("  project-mode counts: rustfmt-normalized in a temp copy (working tree never modified);");
+    println!("    falls back to raw if rustfmt is missing or a file fails to format");
+    println!("  selected-file counts: real source lines (spans tie to reachability), not rustfmt-normalized");
     println!();
     println!("  Project JSON fields: cstat_version, files, aggregate, directory_breakdown");
     println!("  Selected-file JSON fields: file, total_lines, code_lines, projected_reachable_lines, projected_unreachable_lines, reachable_spans, unreachable_spans");
@@ -523,6 +699,15 @@ fn render_loc_explain_json() {
                 "block-comment-only regions via simple /* ... */ state tracking",
             ],
             "not": "semantic Rust parsing",
+        },
+        "project_mode_normalization": {
+            "method": "rustfmt each measured file in a throwaway temp copy, then count",
+            "edition": "detected from the nearest Cargo.toml",
+            "working_tree": "never modified",
+            "fallback": "raw textual counting if rustfmt is unavailable or a file fails to format",
+        },
+        "selected_file_normalization": {
+            "method": "none; counts are real source lines because spans tie to static reachability and coverage",
         },
         "project_json_fields": {
             "cstat_version": "cstat version string",

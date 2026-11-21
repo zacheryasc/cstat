@@ -10,7 +10,7 @@ loops. Incompatible formula or JSON changes must bump `score_version`.
 
 ## Purpose
 
-`code_complexity_cost_v0` measures structural reasoning burden in a Rust
+`code_complexity_cost_v2` measures structural reasoning burden in a Rust
 codebase.
 
 Lower cost means the code is structurally cleaner according to this metric.
@@ -45,13 +45,13 @@ complexity score.
 The agent-facing objective is:
 
 ```text
-minimize code_complexity_cost_v0
+minimize code_complexity_cost_v2
 ```
 
 The environment-facing objective is:
 
 ```text
-minimize code_complexity_cost_v0 subject to harness guards passing
+minimize code_complexity_cost_v2 subject to harness guards passing
 ```
 
 The score itself is pure structural cost. It does not contain verification
@@ -93,7 +93,6 @@ code_complexity_cost =
   + module_coupling_cost
   + abstraction_surface_cost
   + api_surface_cost
-  + stale_surface_cost
 ```
 
 Also emit a normalized companion scalar:
@@ -113,11 +112,13 @@ For each discovered Rust function or method:
 
 ```text
 function_cost =
-    2.0 * max(0, cyclomatic - 5)
-  + 3.0 * max(0, nesting_depth - 3)
-  + 0.2 * max(0, line_count - 50)
-  + 0.5 * max(0, body_stmt_count - 20)
-  + 1.0 * max(0, signature_score - 6)
+    1.2 * cyclomatic
+  + 1.5 * nesting_depth
+  + 0.10 * line_count
+  + 0.15 * body_stmt_count
+  + 0.25 * signature_score
+  + visibility_weight
+  + visibility_weight * 0.5 * max(0, signature_score - 3)
 ```
 
 Where:
@@ -143,12 +144,11 @@ Rationale:
 
 - Branching increases path reasoning.
 - Nesting increases local context stack depth.
-- Long functions increase scan burden, but line count has low weight to avoid
-  rewarding code golf.
-- Body statement count adds a syntax-level size signal that is less sensitive to
-  formatting than physical lines.
+- Branching and nesting are weighted moderately so obvious gnarly functions still
+  surface without dominating repository shape on their own.
+- Long functions increase scan burden. Line count is also measured at file
+  level, so the function-local line weight is intentionally moderate.
 - Signature complexity captures call-boundary and API reasoning cost.
-- Thresholds avoid penalizing ordinary small functions.
 
 ## Component 2: file concentration
 
@@ -159,15 +159,26 @@ For each discovered Rust file:
 
 ```text
 file_cost =
-    0.04 * max(0, code_lines - 400)
-  + 0.25 * max(0, total_symbols - 35)
-  + 1.0  * max(0, function_count - 25)
+    0.25 * code_lines
+  + 3.0  * total_symbols
+  + 1.0  * function_count
+  + visible_non_function_symbol_surface
+```
+
+For every `include!("...")` invocation:
+
+```text
+include_shard_cost =
+    200.0
+  + 0.50 * included_code_lines
+  + 3.00 * included_symbol_count
+  + if missing_or_unparseable: 100.0 else 0.0
 ```
 
 Then:
 
 ```text
-file_concentration_cost = sum(file_cost)
+file_concentration_cost = sum(file_cost) + sum(include_shard_cost)
 ```
 
 Rationale:
@@ -175,8 +186,11 @@ Rationale:
 - Large files require more navigation and context loading.
 - Symbol piles make a file harder to summarize.
 - Function piles usually indicate several concepts sharing one module.
-- The thresholds keep normal files free and penalize concentration rather than
-  raw existence of code.
+- `include!` shards preserve Rust scope without creating a real module
+  boundary. They should not reduce cost by hiding implementation regions in
+  `.inc.rs` fragments.
+- File cost uses raw counts rather than free thresholds because repository
+  shape should reflect ordinary accumulated surface, not only outliers.
 
 ## Component 3: module coupling
 
@@ -186,14 +200,15 @@ tangling.
 ```text
 module_coupling_cost =
     sum_per_module(
-        2.0 * max(0, out_degree - 5)
-      + 1.0 * max(0, in_degree - 10)
+        24.0 * max(0, out_degree - 5)
+      + 12.0 * max(0, in_degree - 10)
     )
-  + sum_bidirectional_pairs(20.0 + 5.0 * pair_strength)
+  + sum_bidirectional_pairs(240.0 + 60.0 * pair_strength)
   + sum_low_cohesion_modules(
         if function_count >= 4:
-            2.0 * function_count * max(0.0, 0.55 - combined_cohesion)
+            24.0 * function_count * max(0.0, 0.55 - combined_cohesion)
     )
+  + sum_per_module(visible_symbol_surface)
 ```
 
 Rationale:
@@ -240,34 +255,34 @@ Rationale:
 
 ## Component 5: API surface
 
-API surface measures interface area that callers outside the local module may
-depend on.
+API surface reports the visible symbol counts used by the other cost
+components. It does not add an independent cost.
 
 ```text
-api_surface_cost =
-    sum_visible_symbols(api_visibility_weight * api_kind_weight)
-  + sum_visible_functions(api_visibility_weight * 0.5 * max(0, signature_score - 3))
+api_surface_cost = 0.0
+```
+
+Visibility is folded into the local component that owns the item:
+
+```text
+visible functions       -> function_complexity_cost
+visible non-functions   -> file_concentration_cost
+visible module surface  -> module_coupling_cost
 ```
 
 Where:
 
 ```text
-api_visibility_weight:
+visibility_weight:
   pub        = 1.0
   pub(crate) = 0.4
 
-api_kind_weight:
+kind_weight:
   function/method = 1.0
   struct          = 1.0
   enum            = 1.0
   trait           = 2.0
   const/static    = 0.5
-```
-
-Then:
-
-```text
-api_surface_cost = sum(api symbol costs)
 ```
 
 Rationale:
@@ -277,30 +292,11 @@ Rationale:
   because it remains internally changeable.
 - Traits are weighted higher because they expose behavioral contracts and
   dispatch/implementation reasoning.
-- Visible functions receive a small signature surcharge so complex public call
-  boundaries cost more than simple public call boundaries.
-- This component may encourage visibility reduction; public API compatibility
-  checks and human review decide whether a reduction is allowed.
+- Keeping visibility cost inside function, file, and module components avoids a
+  separate API bucket competing with the structural buckets.
 
-For v1, only direct `pub` and `pub(crate)` item visibility are counted. Private
+For v2, only direct `pub` and `pub(crate)` item visibility are counted. Private
 items and narrower restricted visibilities such as `pub(super)` are not counted.
-
-## Component 6: stale surface
-
-Stale surface measures code that appears unused by current static evidence.
-
-```text
-stale_surface_cost = 0.5 * static_dead_code_candidate_count
-```
-
-Rationale:
-
-- Unused code still imposes reading, search, and maintenance cost.
-- The weight is low because static dead-code candidates can be false positives
-  around macros, public API usage, trait-object dispatch, build scripts, and
-  string-based dispatch.
-- The score may encourage deletion; the harness and human review decide whether
-  deletion is allowed.
 
 ## JSON output contract
 
@@ -309,7 +305,7 @@ The score command should emit compact JSON by default when `--json` is passed:
 ```json
 {
   "cstat_version": "0.1.0",
-  "score_version": "code_complexity_cost_v1",
+  "score_version": "code_complexity_cost_v2",
   "target": ".",
   "code_complexity_cost": 1234.5,
   "code_complexity_cost_per_kloc": 104.7,
@@ -334,10 +330,6 @@ The score command should emit compact JSON by default when `--json` is passed:
       "cost": 20.0,
       "public_symbols": 12,
       "crate_symbols": 8
-    },
-    "stale_surface": {
-      "cost": 44.5,
-      "candidate_count": 89
     }
   },
   "scope_breakdown": {
@@ -409,7 +401,7 @@ Human output should be short and explanatory:
 
 ```text
 cstat code complexity score
-score version: code_complexity_cost_v1
+score version: code_complexity_cost_v2
 lower is cleaner; harness guards behavior separately
 
 total cost: 1234.5
@@ -421,7 +413,6 @@ components:
   module coupling:       180.0
   abstraction surface:    90.0
   api surface:            20.0
-  stale surface:          44.5
 
 top contributors:
   1. function src/main.rs::main                     115.4
@@ -459,17 +450,16 @@ Implementation steps:
    `symbols` data where possible.
 5. Compute dependency/coupling/cohesion data using existing `deps` logic.
 6. Compute API surface from visible parsed symbols and function signatures.
-7. Compute stale surface using existing `dead_code` analysis.
-8. Classify each function/file into a scope label for reporting:
+7. Classify each function/file into a scope label for reporting:
    - `production`
    - `tests`
    - `benches`
    - future labels as needed
-9. Compute component costs.
-10. Sum total cost.
-11. Build top contributors from function, file, module, abstraction, API surface,
-    and stale contributors.
-12. Render compact human output or stable JSON.
+8. Compute component costs.
+9. Sum total cost.
+10. Build top contributors from function, file, module, abstraction, and API
+    surface contributors.
+11. Render compact human output or stable JSON.
 
 Avoid shelling out to existing CLI commands from the implementation. Reuse the
 same Rust collectors directly so the score is fast, deterministic, and testable.
@@ -499,7 +489,6 @@ Contributor kinds:
 - `file`
 - `module`
 - `abstraction_surface`
-- `stale_surface`
 
 Each contributor should include:
 
@@ -518,7 +507,6 @@ Default top count: 20.
 - The weights are guessed, not learned.
 - Physical line count can be affected by formatting, so it has low weight and is
   paired with body statement count.
-- Static dead-code detection can be wrong.
 - Dependency extraction is source-level and can miss macro-generated edges.
 - Symbol counts come from syntax parsing, not full semantic analysis.
 - A lower score does not prove better architecture in every local case.

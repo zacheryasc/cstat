@@ -4,9 +4,9 @@ use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use crate::{ast_parser, dead_code, deps, flow, loc, render};
+use crate::{ast_parser, deps, flow, loc, render};
 
-const SCORE_VERSION: &str = "code_complexity_cost_v1";
+const SCORE_VERSION: &str = "code_complexity_cost_v2";
 const DEFAULT_TOP: usize = 20;
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,7 +29,6 @@ pub struct ComponentCosts {
     pub module_coupling: ModuleComponent,
     pub abstraction_surface: AbstractionComponent,
     pub api_surface: ApiSurfaceComponent,
-    pub stale_surface: StaleComponent,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,12 +60,6 @@ pub struct ApiSurfaceComponent {
     pub cost: f64,
     pub public_symbols: usize,
     pub crate_symbols: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct StaleComponent {
-    pub cost: f64,
-    pub candidate_count: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -124,7 +117,6 @@ struct Contributor {
 struct FunctionScoreInput {
     file: String,
     function: String,
-    graph_name: String,
     scope: String,
     cyclomatic: usize,
     nesting_depth: usize,
@@ -191,15 +183,10 @@ pub fn analyze_scorecard(
         &mut contributors,
     );
     let module_coupling = score_module_coupling(
+        &symbols,
         files,
         project_path,
         &file_scopes,
-        &mut scope_totals,
-        &mut contributors,
-    );
-    let stale_surface = score_stale_surface(
-        &graph,
-        &function_inputs,
         &mut scope_totals,
         &mut contributors,
     );
@@ -221,8 +208,7 @@ pub fn analyze_scorecard(
         + file_concentration.cost
         + module_coupling.cost
         + abstraction_surface.cost
-        + api_surface.cost
-        + stale_surface.cost;
+        + api_surface.cost;
     let kloc = (code_lines as f64 / 1000.0).max(1.0);
 
     ScorecardReport {
@@ -252,10 +238,6 @@ pub fn analyze_scorecard(
                 cost: round1(api_surface.cost),
                 public_symbols: api_surface.public_symbols,
                 crate_symbols: api_surface.crate_symbols,
-            },
-            stale_surface: StaleComponent {
-                cost: round1(stale_surface.cost),
-                candidate_count: stale_surface.candidate_count,
             },
         },
         scope_breakdown: finalize_scope_totals(scope_totals),
@@ -323,10 +305,6 @@ fn render_scorecard_human(report: &ScorecardReport, verbose: bool) {
         "  {:<24} {:>8.1}",
         "api surface:", report.component_costs.api_surface.cost
     );
-    println!(
-        "  {:<24} {:>8.1}",
-        "stale surface:", report.component_costs.stale_surface.cost
-    );
 
     println!();
     println!("top contributors:");
@@ -369,10 +347,6 @@ fn contributor_label(contributor: &TopContributor) -> String {
             .module
             .clone()
             .unwrap_or_else(|| "<unknown>".to_string()),
-        "stale_surface" => contributor
-            .function
-            .clone()
-            .unwrap_or_else(|| "<unknown>".to_string()),
         _ => "<unknown>".to_string(),
     }
 }
@@ -408,12 +382,6 @@ struct ApiSurfaceScoreSummary {
     crate_symbols: usize,
 }
 
-#[derive(Default)]
-struct StaleScoreSummary {
-    cost: f64,
-    candidate_count: usize,
-}
-
 fn score_functions(
     functions: &[FunctionScoreInput],
     scopes: &mut BTreeMap<String, ScopeAccumulator>,
@@ -425,12 +393,21 @@ fn score_functions(
     };
 
     for function in functions {
-        let branch_cost = 2.0 * excess(function.cyclomatic, 5);
-        let nesting_cost = 3.0 * excess(function.nesting_depth, 3);
-        let span_cost = 0.2 * excess(function.line_count, 50);
-        let body_cost = 0.5 * excess(function.body_stmt_count, 20);
-        let signature_cost = excess(function.signature_score, 6);
-        let cost = branch_cost + nesting_cost + span_cost + body_cost + signature_cost;
+        let branch_cost = 1.2 * function.cyclomatic as f64;
+        let nesting_cost = 1.5 * function.nesting_depth as f64;
+        let span_cost = 0.10 * function.line_count as f64;
+        let body_cost = 0.15 * function.body_stmt_count as f64;
+        let signature_cost = 0.25 * function.signature_score as f64;
+        let visibility_cost = visibility_surface_cost(function.visibility, 1.0);
+        let signature_visibility_cost =
+            signature_visibility_surface_cost(function.visibility, function.signature_score);
+        let cost = branch_cost
+            + nesting_cost
+            + span_cost
+            + body_cost
+            + signature_cost
+            + visibility_cost
+            + signature_visibility_cost;
 
         summary.cost += cost;
         add_scope_cost(scopes, &function.scope, cost);
@@ -455,6 +432,11 @@ fn score_functions(
             component_costs.insert("span".to_string(), span_cost);
             component_costs.insert("body_statements".to_string(), body_cost);
             component_costs.insert("signature".to_string(), signature_cost);
+            component_costs.insert("visibility".to_string(), visibility_cost);
+            component_costs.insert(
+                "signature_visibility".to_string(),
+                signature_visibility_cost,
+            );
 
             contributors.push(Contributor {
                 kind: "function".to_string(),
@@ -493,10 +475,11 @@ fn score_files(
             .unwrap_or_default();
         let total_symbols = total_symbols(file);
         let function_count = file.functions.len();
-        let line_cost = 0.04 * excess(code_lines, 400);
-        let symbol_cost = 0.25 * excess(total_symbols, 35);
-        let function_count_cost = excess(function_count, 25);
-        let cost = line_cost + symbol_cost + function_count_cost;
+        let line_cost = 0.25 * code_lines as f64;
+        let symbol_cost = 3.0 * total_symbols as f64;
+        let function_count_cost = function_count as f64;
+        let visible_symbol_cost = file_visible_symbol_surface_cost(file);
+        let cost = line_cost + symbol_cost + function_count_cost + visible_symbol_cost;
         let scope = file_scopes
             .get(&file.path)
             .cloned()
@@ -515,6 +498,7 @@ fn score_files(
             component_costs.insert("code_lines".to_string(), line_cost);
             component_costs.insert("symbols".to_string(), symbol_cost);
             component_costs.insert("functions".to_string(), function_count_cost);
+            component_costs.insert("visible_symbols".to_string(), visible_symbol_cost);
 
             contributors.push(Contributor {
                 kind: "file".to_string(),
@@ -529,6 +513,10 @@ fn score_files(
             });
         }
     }
+
+    let include_cost =
+        score_include_shards(symbols, project_path, file_scopes, scopes, contributors);
+    summary.cost += include_cost;
 
     summary
 }
@@ -603,183 +591,51 @@ fn score_abstraction_surface(
 fn score_api_surface(
     symbols: &ast_parser::ProjectSymbols,
     functions: &[FunctionScoreInput],
-    project_path: &Path,
-    file_scopes: &HashMap<PathBuf, String>,
-    scopes: &mut BTreeMap<String, ScopeAccumulator>,
-    contributors: &mut Vec<Contributor>,
+    _project_path: &Path,
+    _file_scopes: &HashMap<PathBuf, String>,
+    _scopes: &mut BTreeMap<String, ScopeAccumulator>,
+    _contributors: &mut Vec<Contributor>,
 ) -> ApiSurfaceScoreSummary {
     let mut summary = ApiSurfaceScoreSummary::default();
 
     for function in functions {
-        score_api_symbol(
-            ApiSymbolInput {
-                symbol_kind: "function",
-                file: &function.file,
-                symbol: &function.function,
-                scope: &function.scope,
-                visibility: function.visibility,
-                kind_weight: 1.0,
-                signature_score: Some(function.signature_score),
-            },
-            &mut summary,
-            scopes,
-            contributors,
-        );
+        count_visible_api_symbol(function.visibility, &mut summary);
     }
 
     for file in &symbols.files {
-        let rel_file = relative_file(&file.path, project_path);
-        let scope = file_scopes
-            .get(&file.path)
-            .cloned()
-            .unwrap_or_else(|| file_scope(&file.path, project_path));
-
         for item in &file.structs {
-            score_api_symbol(
-                ApiSymbolInput {
-                    symbol_kind: "struct",
-                    file: &rel_file,
-                    symbol: &item.name,
-                    scope: &scope,
-                    visibility: item.visibility,
-                    kind_weight: 1.0,
-                    signature_score: None,
-                },
-                &mut summary,
-                scopes,
-                contributors,
-            );
+            count_visible_api_symbol(item.visibility, &mut summary);
         }
         for item in &file.enums {
-            score_api_symbol(
-                ApiSymbolInput {
-                    symbol_kind: "enum",
-                    file: &rel_file,
-                    symbol: &item.name,
-                    scope: &scope,
-                    visibility: item.visibility,
-                    kind_weight: 1.0,
-                    signature_score: None,
-                },
-                &mut summary,
-                scopes,
-                contributors,
-            );
+            count_visible_api_symbol(item.visibility, &mut summary);
         }
         for item in &file.traits {
-            score_api_symbol(
-                ApiSymbolInput {
-                    symbol_kind: "trait",
-                    file: &rel_file,
-                    symbol: &item.name,
-                    scope: &scope,
-                    visibility: item.visibility,
-                    kind_weight: 2.0,
-                    signature_score: None,
-                },
-                &mut summary,
-                scopes,
-                contributors,
-            );
+            count_visible_api_symbol(item.visibility, &mut summary);
         }
         for item in &file.consts {
-            score_api_symbol(
-                ApiSymbolInput {
-                    symbol_kind: "const",
-                    file: &rel_file,
-                    symbol: &item.name,
-                    scope: &scope,
-                    visibility: item.visibility,
-                    kind_weight: 0.5,
-                    signature_score: None,
-                },
-                &mut summary,
-                scopes,
-                contributors,
-            );
+            count_visible_api_symbol(item.visibility, &mut summary);
         }
         for item in &file.statics {
-            score_api_symbol(
-                ApiSymbolInput {
-                    symbol_kind: "static",
-                    file: &rel_file,
-                    symbol: &item.name,
-                    scope: &scope,
-                    visibility: item.visibility,
-                    kind_weight: 0.5,
-                    signature_score: None,
-                },
-                &mut summary,
-                scopes,
-                contributors,
-            );
+            count_visible_api_symbol(item.visibility, &mut summary);
         }
     }
 
     summary
 }
 
-struct ApiSymbolInput<'a> {
-    symbol_kind: &'static str,
-    file: &'a str,
-    symbol: &'a str,
-    scope: &'a str,
+fn count_visible_api_symbol(
     visibility: ast_parser::ApiVisibility,
-    kind_weight: f64,
-    signature_score: Option<usize>,
-}
-
-fn score_api_symbol(
-    input: ApiSymbolInput<'_>,
     summary: &mut ApiSurfaceScoreSummary,
-    scopes: &mut BTreeMap<String, ScopeAccumulator>,
-    contributors: &mut Vec<Contributor>,
 ) {
-    let Some((visibility, visibility_weight)) = api_visibility_weight(input.visibility) else {
+    if api_visibility_weight(visibility).is_none() {
         return;
-    };
+    }
 
-    match input.visibility {
+    match visibility {
         ast_parser::ApiVisibility::Public => summary.public_symbols += 1,
         ast_parser::ApiVisibility::Crate => summary.crate_symbols += 1,
         ast_parser::ApiVisibility::Private => {}
     }
-
-    let visibility_surface_cost = visibility_weight * input.kind_weight;
-    let signature_surface_cost = input
-        .signature_score
-        .map(|score| visibility_weight * 0.5 * excess(score, 3))
-        .unwrap_or(0.0);
-    let cost = visibility_surface_cost + signature_surface_cost;
-
-    summary.cost += cost;
-    add_scope_cost(scopes, input.scope, cost);
-
-    let mut reasons = BTreeMap::new();
-    reasons.insert("visibility".to_string(), json!(visibility));
-    reasons.insert("symbol_kind".to_string(), json!(input.symbol_kind));
-    reasons.insert("symbol".to_string(), json!(input.symbol));
-    if let Some(signature_score) = input.signature_score {
-        reasons.insert("signature_score".to_string(), json!(signature_score));
-    }
-
-    let mut component_costs = BTreeMap::new();
-    component_costs.insert("visibility_surface".to_string(), visibility_surface_cost);
-    if signature_surface_cost > 0.0 {
-        component_costs.insert("signature_surface".to_string(), signature_surface_cost);
-    }
-
-    contributors.push(Contributor {
-        kind: "api_surface".to_string(),
-        scope: input.scope.to_string(),
-        file: Some(input.file.to_string()),
-        module: None,
-        function: None,
-        symbol: Some(input.symbol.to_string()),
-        cost,
-        reasons,
-        component_costs,
-    });
 }
 
 fn api_visibility_weight(visibility: ast_parser::ApiVisibility) -> Option<(&'static str, f64)> {
@@ -790,7 +646,67 @@ fn api_visibility_weight(visibility: ast_parser::ApiVisibility) -> Option<(&'sta
     }
 }
 
+fn visibility_surface_cost(visibility: ast_parser::ApiVisibility, kind_weight: f64) -> f64 {
+    api_visibility_weight(visibility)
+        .map(|(_, visibility_weight)| visibility_weight * kind_weight)
+        .unwrap_or(0.0)
+}
+
+fn signature_visibility_surface_cost(
+    visibility: ast_parser::ApiVisibility,
+    signature_score: usize,
+) -> f64 {
+    api_visibility_weight(visibility)
+        .map(|(_, visibility_weight)| visibility_weight * 0.5 * excess(signature_score, 3))
+        .unwrap_or(0.0)
+}
+
+fn file_visible_symbol_surface_cost(file: &ast_parser::FileSymbols) -> f64 {
+    let struct_cost: f64 = file
+        .structs
+        .iter()
+        .map(|item| visibility_surface_cost(item.visibility, 1.0))
+        .sum();
+    let enum_cost: f64 = file
+        .enums
+        .iter()
+        .map(|item| visibility_surface_cost(item.visibility, 1.0))
+        .sum();
+    let trait_cost: f64 = file
+        .traits
+        .iter()
+        .map(|item| visibility_surface_cost(item.visibility, 2.0))
+        .sum();
+    let const_cost: f64 = file
+        .consts
+        .iter()
+        .map(|item| visibility_surface_cost(item.visibility, 0.5))
+        .sum();
+    let static_cost: f64 = file
+        .statics
+        .iter()
+        .map(|item| visibility_surface_cost(item.visibility, 0.5))
+        .sum();
+
+    struct_cost + enum_cost + trait_cost + const_cost + static_cost
+}
+
+fn file_visible_surface_cost(file: &ast_parser::FileSymbols) -> f64 {
+    let function_cost: f64 = file
+        .functions
+        .iter()
+        .map(|function| {
+            let signature_score = signature_score(function);
+            visibility_surface_cost(function.visibility, 1.0)
+                + signature_visibility_surface_cost(function.visibility, signature_score)
+        })
+        .sum();
+
+    function_cost + file_visible_symbol_surface_cost(file)
+}
+
 fn score_module_coupling(
+    symbols: &ast_parser::ProjectSymbols,
     files: &[PathBuf],
     project_path: &Path,
     file_scopes: &HashMap<PathBuf, String>,
@@ -808,8 +724,8 @@ fn score_module_coupling(
     for module in &analysis.modules {
         let in_degree = analysis.in_degree.get(module).copied().unwrap_or(0);
         let out_degree = analysis.out_degree.get(module).copied().unwrap_or(0);
-        let out_cost = 2.0 * excess(out_degree, 5);
-        let in_cost = excess(in_degree, 10);
+        let out_cost = 24.0 * excess(out_degree, 5);
+        let in_cost = 12.0 * excess(in_degree, 10);
         let cost = out_cost + in_cost;
         let scope = module_scopes
             .get(module)
@@ -846,7 +762,7 @@ fn score_module_coupling(
         if *strength < 2 {
             continue;
         }
-        let cost = 20.0 + 5.0 * *strength as f64;
+        let cost = 240.0 + 60.0 * *strength as f64;
         let scope = pair_scope(module_a, module_b, &module_scopes);
         summary.cost += cost;
         add_scope_cost(scopes, &scope, cost);
@@ -876,7 +792,7 @@ fn score_module_coupling(
             continue;
         }
         let cohesion_gap = (0.55 - row.combined).max(0.0);
-        let cost = 2.0 * row.function_count as f64 * cohesion_gap;
+        let cost = 24.0 * row.function_count as f64 * cohesion_gap;
         let scope = module_scopes
             .get(&row.module)
             .cloned()
@@ -906,51 +822,33 @@ fn score_module_coupling(
         }
     }
 
-    summary
-}
+    for file in &symbols.files {
+        let cost = file_visible_surface_cost(file);
+        if cost == 0.0 {
+            continue;
+        }
 
-fn score_stale_surface(
-    graph: &flow::CallGraph,
-    functions: &[FunctionScoreInput],
-    scopes: &mut BTreeMap<String, ScopeAccumulator>,
-    contributors: &mut Vec<Contributor>,
-) -> StaleScoreSummary {
-    let report = dead_code::analyze_graph(graph);
-    let function_scopes: HashMap<&str, &str> = functions
-        .iter()
-        .map(|function| (function.graph_name.as_str(), function.scope.as_str()))
-        .collect();
-    let function_files: HashMap<&str, &str> = functions
-        .iter()
-        .map(|function| (function.graph_name.as_str(), function.file.as_str()))
-        .collect();
-    let summary = StaleScoreSummary {
-        candidate_count: report.candidate_count,
-        cost: 0.5 * report.candidate_count as f64,
-    };
+        let module = render::module_name_from_path(&file.path, project_path);
+        let scope = file_scopes
+            .get(&file.path)
+            .cloned()
+            .unwrap_or_else(|| file_scope(&file.path, project_path));
 
-    for candidate in &report.candidates {
-        let cost = 0.5;
-        let scope = function_scopes
-            .get(candidate.function.as_str())
-            .map(|scope| (*scope).to_string())
-            .unwrap_or_else(|| graph_function_scope(graph, &candidate.function));
+        summary.cost += cost;
         add_scope_cost(scopes, &scope, cost);
 
         let mut reasons = BTreeMap::new();
-        reasons.insert("reason".to_string(), json!(candidate.reason));
+        reasons.insert("visible_surface".to_string(), json!(cost));
 
         let mut component_costs = BTreeMap::new();
-        component_costs.insert("stale_candidate".to_string(), cost);
+        component_costs.insert("visible_surface".to_string(), cost);
 
         contributors.push(Contributor {
-            kind: "stale_surface".to_string(),
+            kind: "module".to_string(),
             scope,
-            file: function_files
-                .get(candidate.function.as_str())
-                .map(|file| (*file).to_string()),
-            module: None,
-            function: Some(candidate.function.clone()),
+            file: None,
+            module: Some(module),
+            function: None,
             symbol: None,
             cost,
             reasons,
@@ -985,7 +883,6 @@ fn collect_function_inputs(
             inputs.push(FunctionScoreInput {
                 file: rel_file.clone(),
                 function: function.name.clone(),
-                graph_name,
                 scope,
                 cyclomatic: function.branch_points + 1,
                 nesting_depth: function.nesting_depth,
@@ -1001,10 +898,7 @@ fn collect_function_inputs(
 }
 
 fn collect_loc_by_file(files: &[PathBuf]) -> HashMap<PathBuf, loc::FileLocStats> {
-    files
-        .iter()
-        .filter_map(|file| loc::count_file_lines(file).map(|stats| (file.clone(), stats)))
-        .collect()
+    loc::count_file_lines_batch(files)
 }
 
 fn collect_file_scopes(files: &[PathBuf], project_path: &Path) -> HashMap<PathBuf, String> {
@@ -1135,30 +1029,6 @@ fn function_scope(
     file_scope.to_string()
 }
 
-fn graph_function_scope(graph: &flow::CallGraph, graph_name: &str) -> String {
-    if matches!(
-        graph.entry_point_kinds.get(graph_name),
-        Some(flow::EntryPointKind::Bench)
-    ) {
-        return "benches".to_string();
-    }
-    if matches!(
-        graph.entry_point_kinds.get(graph_name),
-        Some(flow::EntryPointKind::Test)
-    ) {
-        return "tests".to_string();
-    }
-    if let Some(node) = graph.function_nodes.get(graph_name) {
-        if node.is_bench_entry {
-            return "benches".to_string();
-        }
-        if node.is_test_entry || node.is_test_support {
-            return "tests".to_string();
-        }
-    }
-    "production".to_string()
-}
-
 fn file_scope(file: &Path, project_path: &Path) -> String {
     let rel = file.strip_prefix(project_path).unwrap_or(file);
     let first = rel
@@ -1180,6 +1050,134 @@ fn graph_name_for_function(file_module: &str, function_name: &str) -> String {
     } else {
         format!("{file_module}::{function_name}")
     }
+}
+
+#[derive(Debug, Clone)]
+struct IncludeShard {
+    parent: PathBuf,
+    included: PathBuf,
+    literal: String,
+    line: usize,
+    code_lines: usize,
+    symbol_count: usize,
+    parse_error: bool,
+    missing: bool,
+}
+
+fn score_include_shards(
+    symbols: &ast_parser::ProjectSymbols,
+    project_path: &Path,
+    file_scopes: &HashMap<PathBuf, String>,
+    scopes: &mut BTreeMap<String, ScopeAccumulator>,
+    contributors: &mut Vec<Contributor>,
+) -> f64 {
+    let symbols_by_path: HashMap<PathBuf, &ast_parser::FileSymbols> = symbols
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file))
+        .collect();
+    let mut total_cost = 0.0;
+
+    for parent in &symbols.files {
+        for shard in include_shards_for_file(parent, &symbols_by_path) {
+            let base_cost = 200.0;
+            let line_cost = 0.5 * shard.code_lines as f64;
+            let symbol_cost = 3.0 * shard.symbol_count as f64;
+            let opacity_cost = if shard.parse_error || shard.missing {
+                100.0
+            } else {
+                0.0
+            };
+            let cost = base_cost + line_cost + symbol_cost + opacity_cost;
+            total_cost += cost;
+
+            let scope = file_scopes
+                .get(&shard.parent)
+                .cloned()
+                .unwrap_or_else(|| file_scope(&shard.parent, project_path));
+            add_scope_cost(scopes, &scope, cost);
+
+            let mut reasons = BTreeMap::new();
+            reasons.insert("include_literal".to_string(), json!(shard.literal));
+            reasons.insert("line".to_string(), json!(shard.line));
+            reasons.insert("included_lines".to_string(), json!(shard.code_lines));
+            reasons.insert("included_symbols".to_string(), json!(shard.symbol_count));
+            reasons.insert("parse_error".to_string(), json!(shard.parse_error));
+            reasons.insert("missing".to_string(), json!(shard.missing));
+
+            let mut component_costs = BTreeMap::new();
+            component_costs.insert("base_include".to_string(), base_cost);
+            reasons.insert(
+                "included_file".to_string(),
+                json!(relative_file(&shard.included, project_path)),
+            );
+            component_costs.insert("included_lines".to_string(), line_cost);
+            component_costs.insert("included_symbols".to_string(), symbol_cost);
+            component_costs.insert("opacity".to_string(), opacity_cost);
+
+            contributors.push(Contributor {
+                kind: "include_shard".to_string(),
+                scope,
+                file: Some(relative_file(&shard.parent, project_path)),
+                module: None,
+                function: None,
+                symbol: Some(format!("include!(\"{}\")", shard.literal)),
+                cost,
+                reasons,
+                component_costs,
+            });
+        }
+    }
+
+    total_cost
+}
+
+fn include_shards_for_file(
+    parent: &ast_parser::FileSymbols,
+    symbols_by_path: &HashMap<PathBuf, &ast_parser::FileSymbols>,
+) -> Vec<IncludeShard> {
+    let content = match std::fs::read_to_string(&parent.path) {
+        Ok(content) => content,
+        Err(_) => return Vec::new(),
+    };
+
+    content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let literal = include_literal(line)?;
+            let included = parent.path.parent()?.join(&literal);
+            let canonical_included = included.canonicalize().unwrap_or(included);
+            let loc_stats = loc::count_file_lines(&canonical_included);
+            let included_symbols = symbols_by_path.get(&canonical_included).copied();
+            let missing = !canonical_included.exists();
+            let parse_error = included_symbols
+                .map(|file| file.parse_error)
+                .unwrap_or(missing || loc_stats.is_some());
+
+            Some(IncludeShard {
+                parent: parent.path.clone(),
+                included: canonical_included,
+                literal,
+                line: index + 1,
+                code_lines: loc_stats.map(|stats| stats.code_lines).unwrap_or_default(),
+                symbol_count: included_symbols
+                    .map(|file| total_symbols(file))
+                    .unwrap_or_default(),
+                parse_error,
+                missing,
+            })
+        })
+        .collect()
+}
+
+fn include_literal(line: &str) -> Option<String> {
+    let include_start = line.find("include!")?;
+    let after_include = &line[include_start + "include!".len()..];
+    let open_quote = after_include.find('"')?;
+    let after_open = &after_include[open_quote + 1..];
+    let close_quote = after_open.find('"')?;
+    Some(after_open[..close_quote].to_string())
 }
 
 fn total_symbols(file: &ast_parser::FileSymbols) -> usize {

@@ -479,27 +479,5 @@ mod tests {
             "reachable_edges missing {caller} -> {callee}: {stdout}"
         );
     }
-
-    let dead_output = run_cstat(&file, &["--json", "dead-code"]);
-    assert_success(&dead_output);
-    let dead_stdout = String::from_utf8(dead_output.stdout).unwrap();
-    let dead_value: Value = serde_json::from_str(&dead_stdout).expect("parse dead-code JSON");
-    let dead_functions = dead_value["functions"]
-        .as_array()
-        .expect("dead-code functions");
-    for suffix in expected_suffixes {
-        let row = dead_functions
-            .iter()
-            .find(|entry| {
-                entry["function"]
-                    .as_str()
-                    .is_some_and(|function| function.ends_with(suffix))
-            })
-            .unwrap_or_else(|| panic!("dead-code row missing {suffix}: {dead_stdout}"));
-        assert_eq!(
-            row["candidate"], false,
-            "dead-code still marks {suffix} as candidate: {dead_stdout}"
-        );
-    }
     fs::remove_dir_all(root).unwrap();
 }

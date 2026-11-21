@@ -95,7 +95,7 @@ fn branchy(input: usize) -> usize {
 
     let value = score(&root);
     assert_eq!(value["cstat_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(value["score_version"], "code_complexity_cost_v1");
+    assert_eq!(value["score_version"], "code_complexity_cost_v2");
     for field in [
         "target",
         "code_complexity_cost",
@@ -138,7 +138,7 @@ fn branchy(input: usize) -> usize {
     let stdout = String::from_utf8_lossy(&human.stdout);
     for expected in [
         "Code complexity score",
-        "score version: code_complexity_cost_v1",
+        "score version: code_complexity_cost_v2",
         "lower is cleaner; harness guards behavior separately",
         "components:",
         "api surface:",
@@ -380,7 +380,7 @@ pub fn touch() {
 }
 
 #[test]
-fn widening_visibility_increases_api_surface_cost() {
+fn widening_visibility_increases_function_complexity_cost() {
     let root = temp_project("api-surface");
     write_main(
         &root,
@@ -422,11 +422,11 @@ pub fn exposed(input: usize) -> usize {
     let public_score = score(&root);
 
     assert!(
-        component(&crate_score, "api_surface") > component(&private_score, "api_surface"),
-        "pub(crate) visibility should add API surface cost: private={private_score} crate={crate_score}",
+        component(&crate_score, "function_complexity") > component(&private_score, "function_complexity"),
+        "pub(crate) visibility should add function complexity cost: private={private_score} crate={crate_score}",
     );
     assert!(
-        component(&public_score, "api_surface") > component(&crate_score, "api_surface"),
+        component(&public_score, "function_complexity") > component(&crate_score, "function_complexity"),
         "pub visibility should cost more than pub(crate): crate={crate_score} public={public_score}",
     );
     assert!(
@@ -438,39 +438,53 @@ pub fn exposed(input: usize) -> usize {
 }
 
 #[test]
-fn adding_static_dead_code_candidate_increases_stale_surface() {
-    let root = temp_project("stale");
-    write_main(
-        &root,
-        r#"fn main() {
-    live();
+fn include_shards_are_scored_as_file_concentration_debt() {
+    let root = temp_project("include-shard");
+    fs::write(
+        root.join("src/main.rs"),
+        r#"include!("runtime.inc.rs");
+
+fn main() {
+    runtime();
 }
-
-fn live() {}
 "#,
-    );
-    let before = score(&root);
-
-    write_main(
-        &root,
-        r#"fn main() {
-    live();
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/runtime.inc.rs"),
+        r#"fn runtime() {
+    let mut total = 0;
+    for value in 0..10 {
+        if value % 2 == 0 {
+            total += value;
+        } else {
+            total -= value;
+        }
+    }
+    println!("{total}");
 }
-
-fn live() {}
-
-fn unused_candidate() {}
 "#,
-    );
-    let after = score(&root);
+    )
+    .unwrap();
+
+    let value = score(&root);
+    let file_cost = component(&value, "file_concentration");
+    let include = value["top_contributors"]
+        .as_array()
+        .expect("top contributors")
+        .iter()
+        .find(|item| item["kind"] == "include_shard")
+        .unwrap_or_else(|| panic!("missing include shard contributor: {value}"));
 
     assert!(
-        component(&after, "stale_surface") > component(&before, "stale_surface"),
-        "unused private function should increase stale surface: before={before} after={after}",
+        file_cost >= 200.0,
+        "include shard penalty should land in file concentration: {value}",
     );
+    assert_eq!(include["file"], "src/main.rs");
+    assert_eq!(include["reasons"]["include_literal"], "runtime.inc.rs");
     assert!(
-        total(&after) > total(&before),
-        "unused private function should increase total cost: before={before} after={after}",
+        include["cost"].as_f64().unwrap() >= 200.0,
+        "include shard should carry base opacity cost: {include}",
     );
 
     fs::remove_dir_all(root).unwrap();

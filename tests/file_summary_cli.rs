@@ -102,7 +102,6 @@ fn file_section_commands_accept_file_path() {
         "loc",
         "symbols",
         "deps",
-        "dead-code",
         "test-reachability",
         "call-trace",
     ] {

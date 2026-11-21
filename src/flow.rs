@@ -1123,6 +1123,43 @@ fn is_callable_type(
     }
 }
 
+/// Extern-crate aliases for the package being analyzed.
+///
+/// In a standard lib+bin Cargo package, the binary's `main` reaches its own
+/// library through the package's crate name (e.g. `mvp_system::run_from_args`).
+/// Those call paths are semantically identical to `crate::` from inside the
+/// library, so the resolver strips the leading `<alias>::` just like `crate::`.
+/// Covers both `[package].name` and a custom `[lib].name`, with `-` -> `_`.
+fn crate_aliases(project_path: &Path) -> Vec<String> {
+    let manifest = match std::fs::read_to_string(project_path.join("Cargo.toml")) {
+        Ok(content) => content,
+        Err(_) => return Vec::new(),
+    };
+    let mut names = Vec::new();
+    let mut section = "";
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = trimmed.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            section = header.trim();
+            continue;
+        }
+        if !matches!(section, "package" | "lib") {
+            continue;
+        }
+        if let Some((key, value)) = trimmed.split_once('=') {
+            if key.trim() == "name" {
+                let name = value.trim().trim_matches('"');
+                if !name.is_empty() {
+                    names.push(name.replace('-', "_"));
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 struct Resolver<'a> {
     known: HashMap<String, usize>,
     nodes: &'a HashMap<String, FunctionNode>,
@@ -1130,10 +1167,15 @@ struct Resolver<'a> {
     full_trait_aliases: HashMap<String, String>,
     methods_by_name: HashMap<String, Vec<String>>,
     methods_by_type_and_name: HashMap<(String, String), Vec<String>>,
+    crate_aliases: Vec<String>,
 }
 
 impl<'a> Resolver<'a> {
-    fn new(functions: &[String], nodes: &'a HashMap<String, FunctionNode>) -> Self {
+    fn new(
+        functions: &[String],
+        nodes: &'a HashMap<String, FunctionNode>,
+        crate_aliases: Vec<String>,
+    ) -> Self {
         let known: HashMap<String, usize> = functions
             .iter()
             .enumerate()
@@ -1201,6 +1243,7 @@ impl<'a> Resolver<'a> {
             full_trait_aliases,
             methods_by_name,
             methods_by_type_and_name,
+            crate_aliases,
         }
     }
 
@@ -1261,6 +1304,12 @@ impl<'a> Resolver<'a> {
 
     fn normalized_path_candidates(&self, callee: &str, caller: &str) -> Vec<String> {
         let mut candidates = Vec::new();
+        for alias in &self.crate_aliases {
+            let prefix = format!("{alias}::");
+            if let Some(rest) = callee.strip_prefix(prefix.as_str()) {
+                candidates.push(rest.to_string());
+            }
+        }
         if let Some(rest) = callee.strip_prefix("crate::") {
             candidates.push(rest.to_string());
         } else if let Some(rest) = callee.strip_prefix("self::") {
@@ -1474,7 +1523,7 @@ pub fn build_call_graph(rs_files: &[PathBuf], project_path: &Path) -> CallGraph 
         .map(|record| record.name.clone())
         .collect();
 
-    let resolver = Resolver::new(&functions, &function_nodes);
+    let resolver = Resolver::new(&functions, &function_nodes, crate_aliases(project_path));
     let callable_summaries: HashMap<String, Vec<usize>> = records
         .iter()
         .filter(|record| !record.callable_param_invocations.is_empty())
@@ -1598,25 +1647,6 @@ pub fn build_call_graph(rs_files: &[PathBuf], project_path: &Path) -> CallGraph 
     }
 }
 
-/// Return every function reachable from the graph's entry points.
-pub fn reachable_from_entries(call_graph: &CallGraph) -> HashSet<String> {
-    let mut reachable = HashSet::new();
-    let mut queue: Vec<String> = call_graph.entry_points.clone();
-    while let Some(node) = queue.pop() {
-        if !reachable.insert(node.clone()) {
-            continue;
-        }
-        if let Some(callees) = call_graph.adjacency.get(&node) {
-            for callee in callees {
-                if !reachable.contains(callee) {
-                    queue.push(callee.clone());
-                }
-            }
-        }
-    }
-    reachable
-}
-
 /// Return entry points matching a specific kind.
 pub fn entry_points_by_kind(call_graph: &CallGraph, kind: EntryPointKind) -> Vec<String> {
     call_graph
@@ -1706,6 +1736,31 @@ fn main() {}
             "RuntimeConfigProfile::exercise",
             "RuntimeConfigProfile::default_provider",
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn flow_mvp_chat_resolves_crate_qualified_entry_shim() {
+        // A lib+bin package's binary reaches its own library through the
+        // package's crate name (e.g. `fixture::run_from_args`). That call path
+        // is semantically `crate::` and must resolve to the crate-root symbol;
+        // otherwise the entire production call tree reads as dead code.
+        let root = temp_project("mvp-shim");
+        let main = root.join("src/main.rs");
+        fs::write(
+            &main,
+            r#"
+fn run_from_args() { leaf(); }
+fn leaf() {}
+fn main() { fixture::run_from_args(); }
+"#,
+        )
+        .unwrap();
+
+        let graph = build_call_graph(&[main], &root);
+        assert_edge(&graph, "main", "run_from_args");
+        assert_edge(&graph, "run_from_args", "leaf");
 
         fs::remove_dir_all(root).unwrap();
     }

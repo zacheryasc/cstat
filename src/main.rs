@@ -4,7 +4,6 @@ mod cluster;
 mod complexity;
 mod coverage;
 mod datapaths;
-mod dead_code;
 mod deps;
 mod discovery;
 mod file_metrics;
@@ -58,9 +57,11 @@ Explain mode:
   cstat loc --explain
   cstat loc --explain --json
 
-Project mode reports total physical lines, code_lines, aggregate stats, per-file ranking, and directory breakdown for discovered Rust files. Selected-file mode reports projected static reachable/unreachable production line spans for one Rust source file.
+Project mode reports total_lines, code_lines, aggregate stats, per-file ranking, and directory breakdown for discovered Rust files. Selected-file mode reports projected static reachable/unreachable production line spans for one Rust source file.
 
 code_lines is a static textual classification: blank lines are excluded, // comment-only lines are excluded, and block-comment-only regions are excluded using simple /* ... */ state tracking. It is not semantic Rust parsing.
+
+Project-mode line counts are rustfmt-normalized before classification: every measured file is formatted with rustfmt (edition read from the nearest Cargo.toml) in a throwaway temp copy, then counted, so packing statements onto one line cannot deflate LOC. The working tree is never modified. Files rustfmt cannot parse, and any run where rustfmt is unavailable, fall back to raw textual counting. Selected-file mode is NOT rustfmt-normalized: its counts are real source lines whose spans tie to static reachability and coverage.
 
 Project JSON fields: cstat_version, files[{path,total_lines,code_lines}], aggregate{total_files,total_loc,mean,std_dev,median,min,max}, directory_breakdown[{directory,code_lines}].
 Selected-file JSON fields: file, total_lines, code_lines, projected_reachable_lines, projected_unreachable_lines, reachable_spans[{function,line_start,line_end}], unreachable_spans[{function,line_start,line_end}].
@@ -97,8 +98,6 @@ Use --explain to print this usage and JSON field contract without running analys
         #[arg(long)]
         top: Option<usize>,
     },
-    /// Static dead-code candidates
-    DeadCode,
     /// Static test/benchmark reachability
     TestReachability,
     /// Tree view of calls from the Cargo binary entrypoint or an explicit function.
@@ -200,13 +199,6 @@ fn main() {
                     deps::render_deps_file(project_rs_files, project_path, file, verbose);
                 }
             }
-            Commands::DeadCode => {
-                if json {
-                    dead_code::render_dead_code_file_json(project_rs_files, project_path, file);
-                } else {
-                    dead_code::render_dead_code_file(project_rs_files, project_path, file, verbose);
-                }
-            }
             Commands::TestReachability => {
                 if json {
                     datapaths::render_test_reachability_file_json(
@@ -305,13 +297,6 @@ fn main() {
                 deps::render_deps_json(&rs_files, &project_path);
             } else {
                 deps::render_deps(&rs_files, &project_path, top, verbose);
-            }
-        }
-        Commands::DeadCode => {
-            if json {
-                dead_code::render_dead_code_json(&rs_files, &project_path);
-            } else {
-                dead_code::render_dead_code(&rs_files, &project_path, verbose);
             }
         }
         Commands::TestReachability => {
