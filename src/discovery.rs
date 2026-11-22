@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -46,26 +47,7 @@ pub fn resolve_target(path: &Path) -> Result<AnalysisTarget, String> {
     }
 
     if canonical_path.is_file() {
-        if canonical_path.extension().is_none_or(|ext| ext != "rs") {
-            return Err(format!(
-                "--path file must be a Rust source file: {}",
-                path.display()
-            ));
-        }
-
-        let mut ancestor = canonical_path.parent();
-        let project_path = loop {
-            match ancestor {
-                Some(dir) if dir.join("Cargo.toml").exists() => break dir.to_path_buf(),
-                Some(dir) => ancestor = dir.parent(),
-                None => {
-                    return Err(format!(
-                        "No Cargo.toml found above '{}'",
-                        canonical_path.display()
-                    ));
-                }
-            }
-        };
+        let project_path = crate_for_source(&canonical_path)?;
 
         let project_rs_files = discover_rs_files(&project_path)?;
         if !project_rs_files.contains(&canonical_path) {
@@ -89,6 +71,113 @@ pub fn resolve_target(path: &Path) -> Result<AnalysisTarget, String> {
         "Cannot resolve path '{}': not a file or directory",
         path.display()
     ))
+}
+
+fn crate_for_source(path: &Path) -> Result<PathBuf, String> {
+    if path.extension().is_none_or(|ext| ext != "rs") {
+        return Err(format!(
+            "--path file must be a Rust source file: {}",
+            path.display()
+        ));
+    }
+    path.ancestors()
+        .skip(1)
+        .find(|dir| dir.join("Cargo.toml").exists())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("No Cargo.toml found above '{}'", path.display()))
+}
+
+pub(crate) fn resolve_changed_target(
+    path: &Path,
+    base: &str,
+) -> Result<(PathBuf, Vec<PathBuf>), String> {
+    let path = path
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve path '{}': {}", path.display(), e))?;
+    let (project_path, selected_file) = if path.is_dir() {
+        if !path.join("Cargo.toml").exists() {
+            return Err(format!("No Cargo.toml found at '{}'", path.display()));
+        }
+        (path, None)
+    } else if path.is_file() {
+        (crate_for_source(&path)?, Some(path))
+    } else {
+        return Err(format!(
+            "Cannot resolve path '{}': not a file or directory",
+            path.display()
+        ));
+    };
+    let commit = git_output(
+        &project_path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{base}^{{commit}}"),
+        ],
+    )
+    .map_err(|error| format!("Cannot resolve Git base '{base}': {error}"))?;
+    let commit = String::from_utf8_lossy(&commit);
+    let tracked = git_output(
+        &project_path,
+        &[
+            "diff",
+            "--name-only",
+            "--relative",
+            "--no-renames",
+            "--diff-filter=d",
+            "-z",
+            commit.trim_end(),
+            "--",
+            "*.rs",
+        ],
+    )?;
+    let untracked = git_output(
+        &project_path,
+        &["ls-files", "--others", "--exclude-standard", "-z", "--", "*.rs"],
+    )?;
+    let selected_relative = selected_file
+        .as_deref()
+        .map(|file| file.strip_prefix(&project_path).unwrap());
+    let mut files: Vec<_> = [&tracked, &untracked]
+        .into_iter()
+        .flat_map(|output| output.split(|&byte| byte == 0))
+        .filter(|path| !path.is_empty())
+        .filter_map(git_path)
+        .filter(|path| selected_relative.is_none_or(|selected| *path == selected))
+        .map(|path| project_path.join(path))
+        .filter(|path| path.is_file())
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    Ok((project_path, files))
+}
+
+fn git_output(project_path: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = Command::new("git")
+        .current_dir(project_path)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(args)
+        .output()
+        .map_err(|error| format!("Cannot run Git: {error}"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("git {} failed: {}", args[0], stderr.trim()))
+    }
+}
+
+fn git_path(bytes: &[u8]) -> Option<&Path> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(Path::new(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes).ok().map(Path::new)
+    }
 }
 
 /// Discover all `.rs` source files in a Rust project.

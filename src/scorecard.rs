@@ -91,6 +91,8 @@ pub struct ScoreMetadata {
     pub rust_files: usize,
     pub code_lines: usize,
     pub parse_error_files: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_since: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -130,11 +132,13 @@ pub fn render_scorecard(
     files: &[PathBuf],
     project_path: &Path,
     target: &str,
+    changed_since: Option<&str>,
     top: Option<usize>,
     json_output: bool,
     verbose: bool,
 ) {
-    let report = analyze_scorecard(files, project_path, target, top.unwrap_or(DEFAULT_TOP));
+    let mut report = analyze_scorecard(files, project_path, target, top.unwrap_or(DEFAULT_TOP));
+    report.metadata.changed_since = changed_since.map(str::to_owned);
     if json_output {
         println!("{}", serde_json::to_string(&report).unwrap());
     } else {
@@ -263,6 +267,7 @@ pub fn analyze_scorecard(
             rust_files: files.len(),
             code_lines,
             parse_error_files: symbols.files.iter().filter(|file| file.parse_error).count(),
+            changed_since: None,
         },
     }
 }
@@ -270,6 +275,12 @@ pub fn analyze_scorecard(
 fn render_scorecard_human(report: &ScorecardReport, verbose: bool) {
     render::section_header("Code complexity score");
     println!("score version: {}", report.score_version.bold());
+    if let Some(base) = &report.metadata.changed_since {
+        println!(
+            "scope: {} changed Rust files since {base}",
+            report.metadata.rust_files
+        );
+    }
     println!("lower is cleaner; harness guards behavior separately");
     if verbose {
         render::verbose_block(&[

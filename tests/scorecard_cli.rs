@@ -31,7 +31,7 @@ fn run_cstat(project: &Path, args: &[&str]) -> Output {
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
-        "cstat failed: status={:?}\nstderr={}\nstdout={}",
+        "command failed: status={:?}\nstderr={}\nstdout={}",
         output.status,
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout),
@@ -58,6 +58,114 @@ fn total(value: &Value) -> f64 {
 
 fn write_main(root: &Path, source: &str) {
     fs::write(root.join("src/main.rs"), source).unwrap();
+}
+
+fn git(project: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(project)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", project.join("unused-git-config"))
+        .args([
+            "-c",
+            "user.name=cstat test",
+            "-c",
+            "user.email=cstat@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .expect("invoke git");
+    assert_success(&output);
+}
+
+fn changed_score(project: &Path, base: Option<&str>) -> Value {
+    let mut args = vec!["--json", "scorecard", "--top", "100", "--changed"];
+    args.extend(base);
+    let output = run_cstat(project, &args);
+    assert_success(&output);
+    serde_json::from_slice(&output.stdout).expect("parse changed scorecard JSON")
+}
+
+fn scored_files(report: &Value) -> Vec<&str> {
+    let mut files = report["top_contributors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "file")
+        .map(|item| item["file"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    files.sort_unstable();
+    files
+}
+
+#[test]
+fn changed_scorecard_scores_current_files_relative_to_the_selected_commit() {
+    let root = temp_project("changed");
+    git(&root, &["init", "--quiet", "--template="]);
+    write_main(&root, "fn main() {}\n");
+    fs::write(root.join(".gitignore"), "src/ignored.rs\n").unwrap();
+    for file in ["staged", "unstaged", "deleted"] {
+        fs::write(
+            root.join(format!("src/{file}.rs")),
+            format!("fn {file}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "--quiet", "-m", "baseline"]);
+    git(&root, &["tag", "review-base"]);
+
+    fs::write(root.join("src/committed.rs"), "fn committed() {}\n").unwrap();
+    git(&root, &["add", "src/committed.rs"]);
+    git(&root, &["commit", "--quiet", "-m", "add a function"]);
+
+    let clean = changed_score(&root, None);
+    assert_eq!(clean["metadata"]["rust_files"], 0);
+    assert_eq!(total(&clean), 0.0);
+
+    fs::write(root.join("src/staged.rs"), "fn staged_update() {}\n").unwrap();
+    git(&root, &["add", "src/staged.rs"]);
+    fs::write(root.join("src/unstaged.rs"), "fn working_copy_update() {}\n").unwrap();
+    fs::remove_file(root.join("src/deleted.rs")).unwrap();
+    fs::write(root.join("src/untracked file.rs"), "fn untracked() {}\n").unwrap();
+    fs::write(root.join("src/ignored.rs"), "fn ignored() {}\n").unwrap();
+    fs::write(root.join("build.rs"), "fn main() {}\n").unwrap();
+    fs::write(root.join("README.md"), "Not Rust\n").unwrap();
+
+    let head = changed_score(&root, None);
+    assert_eq!(head["metadata"]["changed_since"], "HEAD");
+    assert_eq!(
+        scored_files(&head),
+        ["build.rs", "src/staged.rs", "src/unstaged.rs", "src/untracked file.rs"]
+    );
+    assert!(head["top_contributors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["function"] == "working_copy_update"));
+
+    let historical = changed_score(&root, Some("review-base"));
+    assert_eq!(historical["metadata"]["changed_since"], "review-base");
+    assert_eq!(
+        scored_files(&historical),
+        [
+            "build.rs",
+            "src/committed.rs",
+            "src/staged.rs",
+            "src/unstaged.rs",
+            "src/untracked file.rs",
+        ]
+    );
+    let single = changed_score(&root.join("src/staged.rs"), None);
+    assert_eq!(scored_files(&single), ["src/staged.rs"]);
+
+    let invalid = run_cstat(&root, &["--json", "scorecard", "--changed", "not-a-ref"]);
+    assert!(!invalid.status.success());
+    let error: Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert!(error["error"].as_str().unwrap().contains("not-a-ref"));
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

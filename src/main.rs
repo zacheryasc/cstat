@@ -91,6 +91,9 @@ Use --explain to print this usage and JSON field contract without running analys
         /// Show only the top N contributors
         #[arg(long)]
         top: Option<usize>,
+        /// Score existing Rust files changed since BASE, including untracked files
+        #[arg(long, value_name = "BASE", num_args = 0..=1, default_missing_value = "HEAD")]
+        changed: Option<String>,
     },
     /// Module dependency connectome
     Deps {
@@ -133,18 +136,26 @@ fn main() {
         return;
     }
 
-    let target = match discovery::resolve_target(&cli.path) {
-        Ok(target) => target,
-        Err(e) => {
-            if json {
-                let err = serde_json::json!({"error": format!("{}", e)});
-                println!("{}", serde_json::to_string(&err).unwrap());
-            } else {
-                eprintln!("Error discovering files: {}", e);
-            }
-            std::process::exit(1);
-        }
-    };
+    if let Commands::Scorecard {
+        top,
+        changed: Some(base),
+    } = &command
+    {
+        let (project_path, files) =
+            discover_or_exit(discovery::resolve_changed_target(&cli.path, base), json);
+        scorecard::render_scorecard(
+            &files,
+            &project_path,
+            &cli.path.display().to_string(),
+            Some(base),
+            *top,
+            json,
+            verbose,
+        );
+        return;
+    }
+
+    let target = discover_or_exit(discovery::resolve_target(&cli.path), json);
     let project_path = &target.project_path;
     let rs_files = discovery::files_for_project(&target);
 
@@ -182,11 +193,12 @@ fn main() {
                     cluster::render_cluster_file(project_rs_files, project_path, file, verbose);
                 }
             }
-            Commands::Scorecard { top } => {
+            Commands::Scorecard { top, .. } => {
                 scorecard::render_scorecard(
                     target_rs_files,
                     project_path,
                     &cli.path.display().to_string(),
+                    None,
                     top,
                     json,
                     verbose,
@@ -279,11 +291,12 @@ fn main() {
         Commands::Span => {
             complexity::run_span(&rs_files, &project_path, json, verbose);
         }
-        Commands::Scorecard { top } => {
+        Commands::Scorecard { top, .. } => {
             scorecard::render_scorecard(
                 &rs_files,
                 &project_path,
                 &cli.path.display().to_string(),
+                None,
                 top,
                 json,
                 verbose,
@@ -331,6 +344,20 @@ fn main() {
                 }
                 std::process::exit(1);
             }
+        }
+    }
+}
+
+fn discover_or_exit<T>(result: Result<T, String>, json: bool) -> T {
+    match result {
+        Ok(target) => target,
+        Err(message) => {
+            if json {
+                println!("{}", serde_json::json!({"error": message}));
+            } else {
+                eprintln!("Error discovering files: {message}");
+            }
+            std::process::exit(1);
         }
     }
 }
