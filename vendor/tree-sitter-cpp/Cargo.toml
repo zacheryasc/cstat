@@ -1,0 +1,16 @@
+[package]
+name = "tree-sitter-cpp"
+version = "0.23.4-cstat.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }

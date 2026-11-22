@@ -1,0 +1,166 @@
+--- a/grammar.js
++++ b/grammar.js
+@@ -14,6 +14,8 @@
+ const PREC = Object.assign(C.PREC, {
+   LAMBDA: 18,
+   NEW: C.PREC.CALL + 1,
++  // Cast and pointer expressions reduce before pointer-to-member operators.
++  POINTER_TO_MEMBER: C.PREC.CAST,
+   STRUCTURED_BINDING: -1,
+   THREE_WAY: C.PREC.RELATIONAL + 1,
+ });
+@@ -92,6 +94,8 @@
+     [$.initializer_pair, $.comma_expression],
+     [$.expression_statement, $._for_statement_body],
+     [$.init_statement, $._for_statement_body],
++    [$.field_expression, $.template_method],
++    [$.qualified_field_identifier, $.template_method],
+     [$.field_expression, $.template_method, $.template_type],
+     [$.qualified_field_identifier, $.template_method, $.template_type],
+   ],
+@@ -153,7 +157,7 @@
+     decltype: $ => seq(
+       'decltype',
+       '(',
+-      $.expression,
++      choice($.expression, $.comma_expression),
+       ')',
+     ),
+ 
+@@ -341,6 +345,15 @@
+-    template_instantiation: $ => seq(
++    template_instantiation: $ => prec(1, seq(
++      optional('extern'),
+       'template',
+-      optional($._declaration_specifiers),
+-      field('declarator', $._declarator),
++      choice(
++        seq(
++          field('class_key', choice('class', 'struct', 'union')),
++          field('name', $._class_name),
++        ),
++        seq(
++          optional($._declaration_specifiers),
++          field('declarator', $._declarator),
++        ),
++      ),
+       ';',
+-    ),
++    )),
+@@ -404,3 +417,3 @@
+       '=',
+-      field('default_value', $.expression),
++      field('default_value', choice($.expression, $.initializer_list)),
+     ),
+@@ -434,6 +447,14 @@
+       ),
+     ),
+ 
++    initializer_pair: ($, original) => choice(
++      original,
++      seq(
++        field('designator', $.field_designator),
++        field('value', $.initializer_list),
++      ),
++    ),
++
+     operator_cast: $ => prec.right(1, seq(
+       'operator',
+       $._declaration_specifiers,
+@@ -636,7 +657,10 @@
+     _function_exception_specification: $ => choice(
+-      $.noexcept,
++      seq($.noexcept, optional($.annotation_macro)),
+       $.throw_specifier,
+     ),
+ 
++    // An opaque object-like annotation after noexcept, not macro expansion.
++    annotation_macro: _ => /_*[A-Z][A-Z0-9_]+/,
++
+     _function_attributes_end: $ => prec.right(seq(
+       optional($.gnu_asm_expression),
+@@ -1007,17 +1031,26 @@
+     field_expression: $ => seq(
+       prec(PREC.FIELD, seq(
+         field('argument', $.expression),
+-        field('operator', choice('.', '.*', '->')),
++        field('operator', choice('.', '->')),
+       )),
+       field('field', choice(
+         prec.dynamic(1, $._field_identifier),
+         alias($.qualified_field_identifier, $.qualified_identifier),
+         $.destructor_name,
++        $.operator_name,
+         $.template_method,
+         alias($.dependent_field_identifier, $.dependent_name),
+       )),
+     ),
+ 
++    _pointer_to_member_expression: $ => prec.left(PREC.POINTER_TO_MEMBER, seq(
++      field('left', $.expression),
++      field('operator', choice('.*', '->*')),
++      field('right', $.expression),
++    )),
++
++    cast_expression: (_, original) => prec.left(PREC.CAST, original.content),
++
+     type_requirement: $ => seq('typename', $._class_name),
+ 
+     compound_requirement: $ => seq(
+@@ -1208,6 +1241,7 @@
+ 
+       return choice(
+         original,
++        $._pointer_to_member_expression,
+         ...table.map(([operator, precedence]) => {
+           return prec.left(precedence, seq(
+             field('left', $.expression),
+@@ -1254,6 +1288,7 @@
+       field('name', choice(
+         alias($.dependent_field_identifier, $.dependent_name),
+         alias($.qualified_field_identifier, $.qualified_identifier),
++        $.operator_name,
+         $.template_method,
+         prec.dynamic(1, $._field_identifier),
+       )),
+@@ -1292,6 +1327,7 @@
+ 
+     _assignment_left_expression: ($, original) => choice(
+       original,
++      alias($._pointer_to_member_expression, $.binary_expression),
+       $.qualified_identifier,
+       $.user_defined_literal,
+     ),
+--- a/node_modules/tree-sitter-c/grammar.js
++++ b/node_modules/tree-sitter-c/grammar.js
+@@ -1101,8 +1101,21 @@
+ 
+     offsetof_expression: $ => prec(PREC.OFFSETOF, seq(
+       'offsetof',
+-      seq('(', field('type', $.type_descriptor), ',', field('member', $._field_identifier), ')'),
++      '(',
++      field('type', $.type_descriptor),
++      ',',
++      field('member', choice($._field_identifier, $.offsetof_member_designator)),
++      ')',
+     )),
++
++    // A member-designator can descend through fields and array elements.
++    offsetof_member_designator: $ => seq(
++      $._field_identifier,
++      repeat1(choice(
++        seq('.', $._field_identifier),
++        seq('[', $.expression, ']'),
++      )),
++    ),
+ 
+     generic_expression: $ => prec(PREC.CALL, seq(
+       '_Generic',
+@@ -1318,6 +1331,7 @@
+       '\\',
+       choice(
+         /[^xuU]/,
++        /\r\n/,
+         /\d{2,3}/,
+         /x[0-9a-fA-F]{1,4}/,
+         /u[0-9a-fA-F]{4}/,

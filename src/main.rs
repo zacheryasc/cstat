@@ -3,6 +3,7 @@ mod call_trace;
 mod cluster;
 mod complexity;
 mod coverage;
+mod cpp;
 mod datapaths;
 mod deps;
 mod discovery;
@@ -13,18 +14,36 @@ mod render;
 mod scorecard;
 mod symbols;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Language {
+    Rust,
+    Cpp,
+}
+
 #[derive(Parser)]
-#[command(name = "cstat", about = "Rust codebase complexity analyzer")]
+#[command(name = "cstat", about = "Rust and C++ source complexity analyzer")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Rust project directory or Rust source file to analyze (defaults to current directory)
+    /// Rust project directory or Rust source file by default; C++ directory or source file with --language cpp
     #[arg(long, default_value = ".", global = true)]
     path: PathBuf,
+
+    /// Source language (default Rust; select cpp for C++ source and headers)
+    #[arg(long, value_enum, default_value = "rust", global = true)]
+    language: Language,
+
+    /// Exclude C++ paths matching a root-relative glob (repeatable)
+    #[arg(long, value_name = "GLOB", global = true)]
+    exclude: Vec<String>,
+
+    /// C++ scorecard include lookup directory, absolute or relative to the analysis root (repeatable; no preprocessing)
+    #[arg(long, value_name = "DIR", global = true)]
+    include_dir: Vec<PathBuf>,
 
     /// Disable colored output
     #[arg(long, global = true)]
@@ -66,6 +85,8 @@ Project-mode line counts are rustfmt-normalized before classification: every mea
 Project JSON fields: cstat_version, files[{path,total_lines,code_lines}], aggregate{total_files,total_loc,mean,std_dev,median,min,max}, directory_breakdown[{directory,code_lines}].
 Selected-file JSON fields: file, total_lines, code_lines, projected_reachable_lines, projected_unreachable_lines, reachable_spans[{function,line_start,line_end}], unreachable_spans[{function,line_start,line_end}].
 
+C++ mode (--language cpp) reports loc_mode: physical, totals, and per-file total_lines, code_lines, comment_lines, and blank_lines in both directory and selected-file modes. It does not format source or project static reachability.
+
 Use --explain to print this usage and JSON field contract without running analysis. --path, --top, and -v are ignored by --explain.
 
 --top only limits the project-mode per-file ranking (ignored for selected-file and --explain modes)."#
@@ -78,7 +99,7 @@ Use --explain to print this usage and JSON field contract without running analys
         #[arg(long)]
         explain: bool,
     },
-    /// Rust AST symbol counts by kind, including trait impl blocks
+    /// Rust AST symbol counts by kind, including trait impl blocks; C++ source symbols with --language cpp
     Symbols,
     /// Function decision/path complexity rankings
     Branching,
@@ -86,12 +107,28 @@ Use --explain to print this usage and JSON field contract without running analys
     Signature,
     /// Function implementation span rankings
     Span,
-    /// Deterministic structural code complexity scorecard
+    #[command(
+        about = "Deterministic structural code complexity scorecard",
+        long_about = r#"Deterministic structural code complexity scorecard for Rust (default) or C++ (--language cpp).
+
+C++ takes a source directory or a single source/header file; no build or manifest is needed.
+It measures syntax as written, not a compiled configuration. Macros are not expanded, and
+literal include lookup uses only the including file's directory (quoted includes) and
+configured --include-dir roots. Use --exclude to omit root-relative paths.
+
+C++ reports cpp_code_complexity_cost_v1. Compare only complete runs with equivalent selection
+rules. Physical line counts are descriptive, not score inputs. --top limits contributors,
+not the score or include graph. Incomplete analysis exits nonzero with no comparable score.
+--changed [BASE] scores existing changed files plus nonignored untracked files, not affected
+dependents. BASE defaults to HEAD. An empty C++ changed selection exits zero without a score.
+
+Example: cstat scorecard --language cpp --path ../project --include-dir include --json"#
+    )]
     Scorecard {
         /// Show only the top N contributors
         #[arg(long)]
         top: Option<usize>,
-        /// Score existing Rust files changed since BASE, including untracked files
+        /// Score existing files of the selected language changed since BASE, including untracked files
         #[arg(long, value_name = "BASE", num_args = 0..=1, default_missing_value = "HEAD")]
         changed: Option<String>,
     },
@@ -126,6 +163,19 @@ fn main() {
 
     if cli.no_color || json {
         colored::control::set_override(false);
+    }
+
+    if cli.language == Language::Cpp {
+        if !run_cpp(&cli) {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if !cli.exclude.is_empty() || !cli.include_dir.is_empty() {
+        discover_or_exit::<()>(
+            Err("--exclude and --include-dir require --language cpp".into()),
+            json,
+        );
     }
 
     let verbose = cli.verbose;
@@ -346,6 +396,45 @@ fn main() {
             }
         }
     }
+}
+
+fn run_cpp(cli: &Cli) -> bool {
+    let (report, base) = match &cli.command {
+        Commands::Loc { explain: true, .. } => {
+            cpp::explain_loc(cli.json);
+            return true;
+        }
+        Commands::Loc { top, .. } => (cpp::Report::Loc { top: *top }, None),
+        Commands::Symbols => (cpp::Report::Symbols, None),
+        Commands::Branching => (cpp::Report::Branching, None),
+        Commands::Signature => (cpp::Report::Signature, None),
+        Commands::Span => (cpp::Report::Span, None),
+        Commands::Scorecard { top, changed } => (cpp::Report::Scorecard { top: *top }, changed.as_deref()),
+        Commands::Deps { .. } => return cpp_unsupported(cli.json, "deps"),
+        Commands::TestReachability => return cpp_unsupported(cli.json, "test-reachability"),
+        Commands::CallTrace { .. } => return cpp_unsupported(cli.json, "call-trace"),
+        Commands::Coverage { .. } => return cpp_unsupported(cli.json, "coverage"),
+        Commands::Cluster => return cpp_unsupported(cli.json, "cluster"),
+    };
+
+    let selection = match discovery::cpp::select(&cli.path, base, &cli.exclude, &cli.include_dir) {
+        Ok(selection) => selection,
+        Err(error) => return cpp_error(cli.json, &error),
+    };
+    cpp::run(&selection, report, cli.json, cli.verbose)
+}
+
+fn cpp_unsupported(json: bool, name: &str) -> bool {
+    cpp_error(json, &format!("'{name}' is not supported with --language cpp"))
+}
+
+fn cpp_error(json: bool, message: &str) -> bool {
+    if json {
+        println!("{}", serde_json::json!({"language": "cpp", "status": "error", "error": message}));
+    } else {
+        eprintln!("Error: {message}");
+    }
+    false
 }
 
 fn discover_or_exit<T>(result: Result<T, String>, json: bool) -> T {
