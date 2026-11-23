@@ -602,6 +602,27 @@ fn diff_hunks_anchor_multiline_operators_to_their_own_lines() {
     ]));
 }
 
+#[test]
+fn diff_hunks_do_not_diff_unrelated_assets() {
+    let p = Project::new("diff-source-pathspec");
+    p.write("project/asset.bin", "original content\n");
+    p.write("project/main.cpp", "int f() {\n    return 0;\n}\n");
+    p.write("outside.cpp", "int g() { return 0; }\n");
+    diff_base(&p);
+    // An unrelated asset's required clean filter cannot read the new content.
+    p.git(&["config", "filter.unavailable.clean", "false"]);
+    p.git(&["config", "filter.unavailable.required", "true"]);
+    p.write(".gitattributes", "*.bin filter=unavailable\n");
+    p.write("project/asset.bin", "different content that needs conversion\n");
+    p.write("project/main.cpp", "int f() {\n    return 1;\n}\n");
+    p.write("outside.cpp", "int g() { return 1; }\n");
+
+    let diff = p.score("project", &["--changed", "diff-base", "--diff-hunks"]);
+    assert_selection(&diff, &["main.cpp"]);
+    assert_eq!(diff["files"][0]["added_lines"], json!([{"start": 2, "end": 2}]));
+    assert_eq!(diff["diff_hunk_complexity_cost"], 1);
+}
+
 #[cfg(unix)]
 #[test]
 fn changed_scorecards_fail_closed_for_inaccessible_index_entries() {

@@ -317,8 +317,9 @@ nonignored untracked files are also eligible on every line, even if their name
 was removed from the index. Absent files are skipped, and a surviving
 deletion-only or mode-only change has no eligible lines.
 
-File extensions, scope under `--path`, and `--exclude` still apply. Leaf
-symlinks are not followed because their Git hunks describe the link, not C++
+Git's patch request is scoped to C++ file extensions under `--path`, so it
+does not diff unrelated assets. `--exclude` still applies. Leaf symlinks are
+not followed because their Git hunks describe the link, not C++
 source. Hardlinked paths are evaluated independently against their own Git
 base paths. Git's ordinary worktree normalization still applies; a clean
 filter that rearranges source lines is incompatible with these coordinates.

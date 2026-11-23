@@ -224,7 +224,19 @@ pub(crate) fn select(
     let changed;
     let mut hunk_ranges = None;
     if let Some(worktree) = &worktree {
-        let scope = explicit.map_or_else(|| OsString::from("."), literal_pathspec);
+        let scope;
+        let cpp_scopes;
+        let scopes = if diff_hunks && explicit.is_none() {
+            // Limit the textual patch at the source: unrelated binaries and
+            // their Git clean filters must not affect a C++ score.
+            cpp_scopes = EXTENSIONS.iter()
+                .map(|ext| OsString::from(format!(":(glob)**/*.{ext}")))
+                .collect::<Vec<_>>();
+            cpp_scopes.as_slice()
+        } else {
+            scope = explicit.map_or_else(|| OsString::from("."), literal_pathspec);
+            std::slice::from_ref(&scope)
+        };
         changed = if let Some(base) = base {
             let commit = super::git_output(
                 &result.root,
@@ -252,7 +264,7 @@ pub(crate) fn select(
                 &result.root,
                 &mut result.diagnostics,
                 if diff_hunks { &patch } else { &names },
-                &scope,
+                scopes,
                 None,
             ))
         } else {
@@ -281,7 +293,7 @@ pub(crate) fn select(
             &result.root,
             &mut result.diagnostics,
             GIT_INVENTORY,
-            &scope,
+            scopes,
             Some((relative_root, &patterns)),
         );
         // A path deleted from the index may still exist as an ignored untracked
@@ -401,7 +413,7 @@ impl Selection {
         root: &Path,
         diagnostics: &mut Vec<Diagnostic>,
         args: &[&str],
-        scope: &OsStr,
+        scopes: &[OsString],
         excludes: Option<(&Path, &Excludes)>,
     ) -> Vec<u8> {
         let mut command = git(root);
@@ -409,7 +421,7 @@ impl Selection {
             // Git gives this legacy environment variable precedence over -U.
             command.env_remove("GIT_DIFF_OPTS");
         }
-        command.args(args).arg(scope);
+        command.args(args).args(scopes);
         let mut output = command.output();
         if let (Some((root, rules)), Some(initial)) = (
             excludes,
