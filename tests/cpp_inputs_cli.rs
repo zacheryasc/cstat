@@ -475,6 +475,133 @@ fn changed_scorecards_use_requested_base_and_score_only_existing_eligible_header
     assert_eq!(historical["components"]["declaration_surface_cost"], 8);
 }
 
+fn diff_base(p: &Project) {
+    p.git(&["init", "--quiet", "--template="]);
+    p.git(&["add", "."]);
+    p.git(&["commit", "--quiet", "--allow-empty", "-m", "baseline"]);
+    p.git(&["tag", "diff-base"]);
+}
+
+fn diff_score(p: &Project) -> Value {
+    p.score(".", &["--changed", "diff-base", "--diff-hunks"])
+}
+
+#[test]
+fn diff_hunks_charge_a_new_branch_not_its_unchanged_neighbors() {
+    let p = Project::new("diff-branch");
+    let start = "int compute(int n, int* p, int mode, int extra) {\n    if (n) {\n        ++n;\n";
+    let end = "        --n;\n    }\n    return n;\n}\n";
+    p.write("main.cpp", &format!("{start}{end}"));
+    diff_base(&p);
+    p.write("main.cpp", &format!("{start}        if (mode) {{\n            ++n;\n        }}\n{end}"));
+
+    let diff = diff_score(&p);
+    assert_selection(&diff, &["main.cpp"]);
+    assert_eq!(diff["score_version"], "cpp_diff_hunk_complexity_cost_v1");
+    assert_eq!(diff["diff_hunk_complexity_cost"], 4);
+    assert_eq!(diff["files"], json!([{
+        "path": "main.cpp",
+        "added_lines": [{"start": 4, "end": 6}],
+        "diff_hunk_complexity_cost": 4
+    }]));
+    assert_eq!(diff["contributors"], json!([
+        {"path": "main.cpp", "line": 4, "column": 9, "kind": "decision", "syntax": "if_statement", "cost": 2},
+        {"path": "main.cpp", "line": 4, "column": 9, "kind": "statement", "syntax": "if_statement", "cost": 1},
+        {"path": "main.cpp", "line": 5, "column": 13, "kind": "statement", "syntax": "expression_statement", "cost": 1}
+    ]));
+
+    let whole = p.score(".", &["--changed", "diff-base"]);
+    assert_eq!(whole["score_version"], "cpp_code_complexity_cost_v1");
+    assert_eq!(whole["inputs"]["decisions"], 2);
+    assert_eq!(whole["inputs"]["parameters"], 4);
+}
+
+#[test]
+fn diff_hunks_charge_replacement_without_deletion_credit() {
+    let p = Project::new("diff-replacement");
+    p.write("main.cpp", "int f(int n) {\n    while (n < 0) {\n        ++n;\n    }\n    return n;\n}\n");
+    diff_base(&p);
+    p.write("main.cpp", "int f(int n) {\n    n += 2;\n    return n;\n}\n");
+
+    let diff = diff_score(&p);
+    assert_eq!(diff["diff_hunk_complexity_cost"], 1, "{diff}");
+    assert_eq!(diff["files"][0]["added_lines"], json!([{"start": 2, "end": 2}]));
+    assert_eq!(diff["contributors"], json!([
+        {"path": "main.cpp", "line": 2, "column": 5, "kind": "statement", "syntax": "expression_statement", "cost": 1}
+    ]));
+}
+
+#[test]
+fn diff_hunks_deletions_add_no_complexity() {
+    let p = Project::new("diff-deletion");
+    p.write("main.cpp", "int f(int n) {\n    if (n < 0) { ++n; }\n    return n;\n}\n");
+    p.write("removed.hpp", "inline int g() { return 1; }\n");
+    diff_base(&p);
+    p.write("main.cpp", "int f(int n) {\n    return n;\n}\n");
+    fs::remove_file(p.0.join("removed.hpp")).unwrap();
+
+    let diff = diff_score(&p);
+    assert_selection(&diff, &["main.cpp"]);
+    assert_eq!(diff["diff_hunk_complexity_cost"], 0);
+    assert_eq!(diff["files"][0]["added_lines"], json!([]));
+    assert_eq!(diff["contributors"], json!([]));
+}
+
+#[test]
+fn diff_hunks_score_new_tracked_and_untracked_files_in_full() {
+    let p = Project::new("diff-new-files");
+    diff_base(&p);
+    let header = "new/added header.hpp";
+    p.write(header, "// header\n\nint make(int* value) {\n    if (value)\n        return *value;\n    return 0;\n}\n\n");
+    p.git(&["add", header]);
+    p.git(&["commit", "--quiet", "-m", "new header"]);
+    p.write("untracked.cpp", "int fresh() { return 0; }");
+
+    let diff = diff_score(&p);
+    assert_selection(&diff, &[header, "untracked.cpp"]);
+    assert_eq!(diff["diff_hunk_complexity_cost"], 12, "{diff}");
+    assert_eq!(diff["files"], json!([
+        {"path": header, "added_lines": [{"start": 1, "end": 8}], "diff_hunk_complexity_cost": 9},
+        {"path": "untracked.cpp", "added_lines": [{"start": 1, "end": 1}], "diff_hunk_complexity_cost": 3}
+    ]));
+    assert_eq!(diff["contributors"].as_array().unwrap().iter().map(|row| row["cost"].as_u64().unwrap()).sum::<u64>(), 12);
+}
+
+#[test]
+fn diff_hunks_anchor_multiline_operators_to_their_own_lines() {
+    let p = Project::new("diff-multiline");
+    let base = concat!(
+        "int compute(const int\n",
+        "    value, int flag)\n",
+        "{\n",
+        "    if (flag\n",
+        "        && value\n",
+        "       )\n",
+        "        return flag\n",
+        "            ? 1\n",
+        "            : 0;\n",
+        "    return 0;\n",
+        "}\n",
+    );
+    p.write("main.cpp", base);
+    diff_base(&p);
+    p.write("main.cpp", &base
+        .replace("    value,", "    *value,")
+        .replace("       )", "        && flag > 1\n       )")
+        .replace("? 1", "? 2"));
+
+    let diff = diff_score(&p);
+    assert_eq!(diff["diff_hunk_complexity_cost"], 5, "{diff}");
+    assert_eq!(diff["files"][0]["added_lines"], json!([
+        {"start": 2, "end": 2}, {"start": 6, "end": 6}, {"start": 9, "end": 9}
+    ]));
+    assert_eq!(diff["contributors"], json!([
+        {"path": "main.cpp", "line": 2, "column": 5, "kind": "type_complexity", "syntax": "*", "cost": 1},
+        {"path": "main.cpp", "line": 6, "column": 9, "kind": "decision", "syntax": "&&", "cost": 2},
+        {"path": "main.cpp", "line": 9, "column": 13, "kind": "decision", "syntax": "?", "cost": 2}
+    ]));
+}
+
 #[cfg(unix)]
 #[test]
 fn changed_scorecards_fail_closed_for_inaccessible_index_entries() {

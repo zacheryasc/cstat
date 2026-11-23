@@ -121,6 +121,9 @@ rules. Physical line counts are descriptive, not score inputs. --top limits cont
 not the score or include graph. Incomplete analysis exits nonzero with no comparable score.
 --changed [BASE] scores existing changed files plus nonignored untracked files, not affected
 dependents. BASE defaults to HEAD. An empty C++ changed selection exits zero without a score.
+With --diff-hunks, score only new-side changed C++ syntax, not whole files. This
+reports cpp_diff_hunk_complexity_cost_v1, with new-side line ranges and contributors.
+This mode does not resolve includes; omit --include-dir.
 
 Example: cstat scorecard --language cpp --path ../project --include-dir include --json"#
     )]
@@ -131,6 +134,9 @@ Example: cstat scorecard --language cpp --path ../project --include-dir include 
         /// Score existing files of the selected language changed since BASE, including untracked files
         #[arg(long, value_name = "BASE", num_args = 0..=1, default_missing_value = "HEAD")]
         changed: Option<String>,
+        /// Score only new-side changed syntax (requires --language cpp and --changed)
+        #[arg(long, requires = "changed", conflicts_with = "include_dir")]
+        diff_hunks: bool,
     },
     /// Module dependency connectome
     Deps {
@@ -171,6 +177,9 @@ fn main() {
         }
         return;
     }
+    if matches!(cli.command, Commands::Scorecard { diff_hunks: true, .. }) {
+        discover_or_exit::<()>(Err("--diff-hunks requires --language cpp".into()), json);
+    }
     if !cli.exclude.is_empty() || !cli.include_dir.is_empty() {
         discover_or_exit::<()>(
             Err("--exclude and --include-dir require --language cpp".into()),
@@ -189,6 +198,7 @@ fn main() {
     if let Commands::Scorecard {
         top,
         changed: Some(base),
+        ..
     } = &command
     {
         let (project_path, files) =
@@ -409,7 +419,14 @@ fn run_cpp(cli: &Cli) -> bool {
         Commands::Branching => (cpp::Report::Branching, None),
         Commands::Signature => (cpp::Report::Signature, None),
         Commands::Span => (cpp::Report::Span, None),
-        Commands::Scorecard { top, changed } => (cpp::Report::Scorecard { top: *top }, changed.as_deref()),
+        Commands::Scorecard { top, changed, diff_hunks } => {
+            let report = if *diff_hunks {
+                cpp::Report::DiffHunks { top: *top }
+            } else {
+                cpp::Report::Scorecard { top: *top }
+            };
+            (report, changed.as_deref())
+        }
         Commands::Deps { .. } => return cpp_unsupported(cli.json, "deps"),
         Commands::TestReachability => return cpp_unsupported(cli.json, "test-reachability"),
         Commands::CallTrace { .. } => return cpp_unsupported(cli.json, "call-trace"),
@@ -417,7 +434,8 @@ fn run_cpp(cli: &Cli) -> bool {
         Commands::Cluster => return cpp_unsupported(cli.json, "cluster"),
     };
 
-    let selection = match discovery::cpp::select(&cli.path, base, &cli.exclude, &cli.include_dir) {
+    let diff_hunks = matches!(report, cpp::Report::DiffHunks { .. });
+    let selection = match discovery::cpp::select(&cli.path, base, &cli.exclude, &cli.include_dir, diff_hunks) {
         Ok(selection) => selection,
         Err(error) => return cpp_error(cli.json, &error),
     };

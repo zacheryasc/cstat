@@ -1,4 +1,5 @@
 mod extract;
+mod hunks;
 mod includes;
 mod metrics;
 mod report;
@@ -10,7 +11,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::Serialize;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Point};
 
 use crate::discovery::cpp::{display_path, Selection};
 use metrics::{BodyMetrics, Loc};
@@ -127,6 +128,7 @@ struct Symbol {
     kind: Kind,
     role: Role,
     name: String,
+    name_position: Point,
     span: Span,
     access: Option<Access>,
     named_surface: bool,
@@ -170,6 +172,7 @@ struct File<'a> {
     loc: Option<Loc>,
     symbols: Vec<Symbol>,
     includes: Vec<includes::Directive>,
+    hunks: Option<hunks::FileScore<'a>>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Serialize)]
@@ -230,6 +233,7 @@ enum Inputs {
     Loc,
     Symbols,
     Scorecard,
+    DiffHunks { collect_contributors: bool },
 }
 
 fn analyze(selection: &Selection, inputs: Inputs) -> Analysis<'_> {
@@ -263,28 +267,45 @@ fn analyze(selection: &Selection, inputs: Inputs) -> Analysis<'_> {
             continue;
         };
         let root = tree.root_node();
-        if root.has_error() {
+        let syntax_error = root.has_error();
+        if syntax_error {
             syntax_diagnostics(path, root, &mut analysis.diagnostics);
         } else {
             analysis.parsed += 1;
         }
+        let mut hunks = if let Inputs::DiffHunks { collect_contributors } = inputs {
+            let added = selection.added_lines(path).expect("selected diff-hunk path has ranges");
+            let end = root.end_position();
+            let score = hunks::FileScore::new(added, end.row + usize::from(end.column != 0), collect_contributors);
+            if score.is_none() {
+                analysis.diagnostics.push(Diagnostic::file(
+                    path, "diff_error", "Git's new-side ranges extend beyond the parsed source".into(),
+                ));
+            }
+            score
+        } else {
+            None
+        };
         analysis.files.push(File {
             path,
             header: inputs != Inputs::Loc
                 && path.extension().is_some_and(|ext| {
                     matches!(ext.to_str(), Some("h" | "hpp" | "hh" | "hxx" | "ipp" | "tpp"))
                 }),
-            loc: (inputs != Inputs::Symbols).then(|| metrics::physical_loc(&source, root)),
-            symbols: if inputs == Inputs::Loc {
+            loc: matches!(inputs, Inputs::Loc | Inputs::Scorecard).then(|| metrics::physical_loc(&source, root)),
+            symbols: if inputs == Inputs::Loc
+                || (matches!(inputs, Inputs::DiffHunks { .. }) && (syntax_error || hunks.is_none()))
+            {
                 Vec::new()
             } else {
-                extract::symbols(root, &source, &mut local_scopes)
+                extract::symbols(root, &source, &mut local_scopes, hunks.as_mut())
             },
             includes: if inputs == Inputs::Scorecard {
                 includes::collect(&source, root)
             } else {
                 Vec::new()
             },
+            hunks,
         });
         for (name, kind) in local_scopes.drain() {
             OwnerKind::observe(&mut scopes, name, kind);
@@ -295,6 +316,9 @@ fn analyze(selection: &Selection, inputs: Inputs) -> Analysis<'_> {
             if let Some(kind) = symbol.qualified_owner.take().and_then(|name| scopes.get(&name).copied()) {
                 symbol.resolve_owner(kind);
             }
+        }
+        if let Some(hunks) = &mut file.hunks {
+            hunks.finish(&file.symbols, file.header);
         }
     }
     analysis.finish(selection.files.len());

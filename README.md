@@ -29,6 +29,7 @@ no build, manifest, or compilation database is needed.
 ```sh
 cstat scorecard --language cpp --path ../project --include-dir include --exclude 'generated/**' --top 10
 cstat scorecard --language cpp --path ../project --changed HEAD~1 --json
+cstat scorecard --language cpp --path ../project --changed HEAD~1 --diff-hunks --json
 cstat branching --language cpp --path ../project/src/widget.cpp --json
 ```
 
@@ -54,6 +55,11 @@ Analysis is syntax-only: no macro expansion, active build configuration,
 template instantiation, or overload resolution. Unreadable files or syntax
 errors make the run incomplete and nonzero; the scorecard omits the scalar.
 A valid empty `--changed` exits zero without a score.
+
+Use `--changed [BASE] --diff-hunks` to measure only syntax anchored to Git's
+new-side lines. It reports `cpp_diff_hunk_complexity_cost_v1`, not a whole-file
+score or a score delta. New files are covered in full; deletions never subtract.
+JSON lists the paths, added line ranges, and each charged construct.
 
 See the [C++ score specification](notes/CPP_SCORE_SPEC.md) for metrics, include
 resolution rules, and the JSON contract.

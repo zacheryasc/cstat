@@ -27,11 +27,28 @@ pub(super) struct BranchCategories {
 
 pub(super) fn body_metrics(owner: Node<'_>, body: Node<'_>) -> BodyMetrics {
     let mut metrics = BodyMetrics::default();
+    visit_body(owner, body, |_, decision, statement, depth| {
+        if let Some(decision) = decision {
+            decision.record(&mut metrics.categories);
+            metrics.decisions += 1;
+        }
+        metrics.max_nesting = metrics.max_nesting.max(depth);
+        metrics.statements += usize::from(statement);
+    });
+    metrics.path_count = 1 + metrics.decisions;
+    metrics
+}
+
+pub(super) fn visit_body<'tree>(
+    owner: Node<'tree>,
+    body: Node<'tree>,
+    mut visit: impl FnMut(Node<'tree>, Option<Decision>, bool, usize),
+) {
     if owner.kind() == "function_definition" {
         let mut cursor = owner.walk();
         for child in owner.named_children(&mut cursor) {
             if child.kind() == "field_initializer_list" {
-                metrics.add_region(child);
+                visit_region(child, &mut visit);
             }
         }
     }
@@ -40,102 +57,144 @@ pub(super) fn body_metrics(owner: Node<'_>, body: Node<'_>) -> BodyMetrics {
         .parent()
         .filter(|parent| parent.kind() == "try_statement" && parent.parent() == Some(owner))
         .unwrap_or(body);
-    metrics.add_region(region);
-    metrics.path_count = 1 + metrics.decisions;
-    metrics
+    visit_region(region, &mut visit);
 }
 
-impl BodyMetrics {
-    fn add_region(&mut self, root: Node<'_>) {
-        let mut depth = 0;
-        let mut directive_condition = None;
-        walk(root, |node, entering| {
-            let kind = node.kind();
-            let nests = increases_depth(kind);
-            if !entering {
-                depth -= usize::from(nests);
-                return true;
-            }
-            if directive_condition == Some(node) {
-                directive_condition = None;
+fn visit_region<'tree>(
+    root: Node<'tree>,
+    visit: &mut impl FnMut(Node<'tree>, Option<Decision>, bool, usize),
+) {
+    let mut depth = 0;
+    let mut directive_condition = None;
+    walk(root, |node, entering| {
+        let kind = node.kind();
+        let nests = increases_depth(kind);
+        if !entering {
+            depth -= usize::from(nests);
+            return true;
+        }
+        if directive_condition == Some(node) {
+            directive_condition = None;
+            return false;
+        }
+        if !node.is_named() || node.is_missing() {
+            return false;
+        }
+
+        match kind {
+            "function_definition" => return false,
+            // The remaining lambda child, `lambda_capture_specifier`, belongs
+            // to the enclosing expression. The lambda's own region is its body.
+            "compound_statement"
+            | "template_parameter_list"
+            | "requires_clause"
+            | "abstract_function_declarator"
+            | "ERROR"
+                if node != root && parent_kind(node) == Some("lambda_expression") =>
+            {
                 return false;
             }
-            if !node.is_named() || node.is_missing() {
+            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
+                // The grammar exposes a declaration without declarators as
+                // the specifier itself, rather than wrapping it in `declaration`.
+                if matches!(
+                    parent_kind(node),
+                    Some(
+                        "compound_statement"
+                            | "declaration_list"
+                            | "preproc_if"
+                            | "preproc_ifdef"
+                            | "preproc_elif"
+                            | "preproc_elifdef"
+                            | "preproc_else"
+                    )
+                ) {
+                    visit(node, None, true, depth);
+                }
                 return false;
             }
-
-            match kind {
-                "function_definition" => return false,
-                // The remaining lambda child, `lambda_capture_specifier`, belongs
-                // to the enclosing expression. The lambda's own region is its body.
-                "compound_statement"
-                | "template_parameter_list"
-                | "requires_clause"
-                | "abstract_function_declarator"
-                | "ERROR"
-                    if node != root && parent_kind(node) == Some("lambda_expression") =>
-                {
-                    return false;
-                }
-                "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
-                    // The grammar exposes a declaration without declarators as
-                    // the specifier itself, rather than wrapping it in `declaration`.
-                    if matches!(
-                        parent_kind(node),
-                        Some(
-                            "compound_statement"
-                                | "declaration_list"
-                                | "preproc_if"
-                                | "preproc_ifdef"
-                                | "preproc_elif"
-                                | "preproc_elifdef"
-                                | "preproc_else"
-                        )
-                    ) {
-                        self.statements += 1;
-                    }
-                    return false;
-                }
-                "preproc_if" | "preproc_elif" => {
-                    directive_condition = node.child_by_field_name("condition");
-                }
-                "preproc_def" | "preproc_function_def" | "preproc_call" | "preproc_include" => {
-                    return false;
-                }
-                _ => {}
+            "preproc_if" | "preproc_elif" => {
+                directive_condition = node.child_by_field_name("condition");
             }
-
-            let category = match kind {
-                "if_statement" => Some(&mut self.categories.if_statements),
-                "for_statement" => Some(&mut self.categories.for_loops),
-                "for_range_loop" => Some(&mut self.categories.range_for_loops),
-                "while_statement" => Some(&mut self.categories.while_loops),
-                "do_statement" => Some(&mut self.categories.do_while_loops),
-                "case_statement" if node.child(0).is_some_and(|token| token.kind() == "default") => {
-                    Some(&mut self.categories.default_labels)
-                }
-                "case_statement" => Some(&mut self.categories.case_labels),
-                "catch_clause" => Some(&mut self.categories.catch_clauses),
-                "conditional_expression" => Some(&mut self.categories.conditional_expressions),
-                "binary_expression" => match node.child_by_field_name("operator").map(|op| op.kind()) {
-                    Some("&&" | "and") => Some(&mut self.categories.logical_and),
-                    Some("||" | "or") => Some(&mut self.categories.logical_or),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some(category) = category {
-                *category += 1;
-                self.decisions += 1;
+            "preproc_def" | "preproc_function_def" | "preproc_call" | "preproc_include" => {
+                return false;
             }
+            _ => {}
+        }
 
-            if nests {
-                depth += 1;
-                self.max_nesting = self.max_nesting.max(depth);
+        let decision = Decision::of(node);
+        depth += usize::from(nests);
+        let statement = is_statement(node, kind);
+        if nests || statement || decision.is_some() {
+            visit(node, decision, statement, depth);
+        }
+        true
+    });
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Decision {
+    If,
+    For,
+    RangeFor,
+    While,
+    Do,
+    Case,
+    Default,
+    Catch,
+    Conditional,
+    And,
+    Or,
+}
+
+impl Decision {
+    fn of(node: Node<'_>) -> Option<Self> {
+        Some(match node.kind() {
+            "if_statement" => Self::If,
+            "for_statement" => Self::For,
+            "for_range_loop" => Self::RangeFor,
+            "while_statement" => Self::While,
+            "do_statement" => Self::Do,
+            "case_statement" if node.child(0).is_some_and(|token| token.kind() == "default") => Self::Default,
+            "case_statement" => Self::Case,
+            "catch_clause" => Self::Catch,
+            "conditional_expression" => Self::Conditional,
+            "binary_expression" => match node.child_by_field_name("operator").map(|op| op.kind()) {
+                Some("&&" | "and") => Self::And,
+                Some("||" | "or") => Self::Or,
+                _ => return None,
+            },
+            _ => return None,
+        })
+    }
+
+    fn record(self, categories: &mut BranchCategories) {
+        *match self {
+            Self::If => &mut categories.if_statements,
+            Self::For => &mut categories.for_loops,
+            Self::RangeFor => &mut categories.range_for_loops,
+            Self::While => &mut categories.while_loops,
+            Self::Do => &mut categories.do_while_loops,
+            Self::Case => &mut categories.case_labels,
+            Self::Default => &mut categories.default_labels,
+            Self::Catch => &mut categories.catch_clauses,
+            Self::Conditional => &mut categories.conditional_expressions,
+            Self::And => &mut categories.logical_and,
+            Self::Or => &mut categories.logical_or,
+        } += 1;
+    }
+
+    pub(super) fn anchor(self, node: Node<'_>) -> Node<'_> {
+        match self {
+            Self::And | Self::Or => node.child_by_field_name("operator").unwrap(),
+            Self::Conditional => {
+                let mut cursor = node.walk();
+                let token = node.children(&mut cursor).find(|child| child.kind() == "?");
+                token.expect("a conditional expression has a question mark")
             }
-            self.statements += usize::from(is_statement(node, kind));
-            true
-        });
+            Self::Case | Self::Default => node.child(0).unwrap(),
+            _ => node,
+        }
     }
 }
 

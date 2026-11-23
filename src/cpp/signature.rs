@@ -203,15 +203,32 @@ fn word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || !byte.is_ascii()
 }
 
+pub(super) enum SignaturePart {
+    TemplateParameter,
+    Constraint,
+    TypeComplexity,
+    TypeLayer(&'static str),
+}
+
 pub(super) fn template_parameter_count(templates: &[Node<'_>]) -> usize {
+    template_parameter_cost(templates, &mut |_, _| 1)
+}
+
+fn template_parameter_cost<'tree>(
+    templates: &[Node<'tree>],
+    account: &mut impl FnMut(Node<'tree>, SignaturePart) -> usize,
+) -> usize {
     templates
         .iter()
         .filter_map(|node| node.child_by_field_name("parameters"))
-        .map(template_list_count)
+        .map(|list| template_list_cost(list, account))
         .sum()
 }
 
-fn template_list_count(list: Node<'_>) -> usize {
+fn template_list_cost<'tree>(
+    list: Node<'tree>,
+    account: &mut impl FnMut(Node<'tree>, SignaturePart) -> usize,
+) -> usize {
     let mut cursor = list.walk();
     list.named_children(&mut cursor)
         .filter(|child| {
@@ -227,25 +244,31 @@ fn template_list_count(list: Node<'_>) -> usize {
                         | "template_template_parameter_declaration"
                 )
         })
-        .count()
+        .map(|child| account(child, SignaturePart::TemplateParameter))
+        .sum()
 }
 
-pub(super) fn signature(
-    owner: Node<'_>,
-    decl: Option<Declarator<'_>>,
-    templates: &[Node<'_>],
+pub(super) fn signature<'tree>(
+    owner: Node<'tree>,
+    decl: Option<Declarator<'tree>>,
+    templates: &[Node<'tree>],
     source: &[u8],
+    mut account: impl FnMut(Node<'tree>, SignaturePart) -> usize,
 ) -> Signature {
     let mut result = Signature {
-        template_parameters: template_parameter_count(templates),
-        constraints: templates.iter().copied().map(attached_constraints).sum(),
+        template_parameters: template_parameter_cost(templates, &mut account),
+        constraints: templates
+            .iter()
+            .copied()
+            .map(|node| attached_constraints(node, &mut account))
+            .sum(),
         ..Signature::default()
     };
     let function = if owner.kind() == "lambda_expression" {
         if let Some(list) = owner.child_by_field_name("template_parameters") {
-            result.template_parameters += template_list_count(list);
+            result.template_parameters += template_list_cost(list, &mut account);
         }
-        result.constraints += attached_constraints(owner);
+        result.constraints += attached_constraints(owner, &mut account);
         owner.child_by_field_name("declarator")
     } else {
         decl.and_then(|decl| decl.function)
@@ -261,7 +284,7 @@ pub(super) fn signature(
                 "parameter_declaration" | "optional_parameter_declaration"
                 | "variadic_parameter_declaration" => {
                     result.parameters += 1;
-                    result.type_complexity += spelled_type_cost(parameter);
+                    result.type_complexity += spelled_type_cost(parameter, &mut account);
                     if parameter.kind() == "variadic_parameter_declaration" {
                         if has_comma_free_ellipsis(parameter) {
                             result.parameters += 1;
@@ -284,17 +307,19 @@ pub(super) fn signature(
             result.parameters = 0;
         }
     }
-    result.type_complexity += field_type_cost(owner, "type") + trailing_return_cost(function);
-    result.constraints += attached_constraints(function);
+    result.type_complexity +=
+        field_type_cost(owner, "type", &mut account) + trailing_return_cost(function, &mut account);
+    result.constraints += attached_constraints(function, &mut account);
     // The derived layers outside the callable are its return type, not its parameters.
     // Walking ancestors also isolates this declarator in a declaration with multiple names.
     let mut current = function.parent();
     while let Some(layer) = current.filter(|layer| *layer != owner) {
-        result.constraints += attached_constraints(layer);
-        result.type_complexity += layer_type_cost(layer);
+        result.constraints += attached_constraints(layer, &mut account);
+        result.type_complexity += layer_type_cost(layer, &mut account);
         if layer.kind() == "operator_cast" {
-            result.type_complexity += field_type_cost(layer, "type");
-            result.type_complexity += inner_declarator(function).map_or(0, declarator_type_cost);
+            result.type_complexity += field_type_cost(layer, "type", &mut account);
+            result.type_complexity += inner_declarator(function)
+                .map_or(0, |node| declarator_type_cost(node, &mut account));
         }
         current = layer.parent();
     }
@@ -333,85 +358,148 @@ fn is_unqualified_void(parameter: Node<'_>, source: &[u8]) -> bool {
     }) && !parameter.named_children(&mut cursor).any(|node| node.kind() == "type_qualifier")
 }
 
-fn attached_constraints(node: Node<'_>) -> usize {
+fn attached_constraints<'tree>(
+    node: Node<'tree>,
+    account: &mut impl FnMut(Node<'tree>, SignaturePart) -> usize,
+) -> usize {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .filter(|child| child.kind() == "requires_clause" && !child.is_missing())
-        .map(|clause| 1 + requires_expressions(clause))
+        .map(|clause| {
+            // Both requires forms begin at their keyword.
+            account(clause, SignaturePart::Constraint) + requires_expressions(clause, account)
+        })
         .sum()
 }
 
-fn requires_expressions(node: Node<'_>) -> usize {
+fn requires_expressions<'tree>(
+    node: Node<'tree>,
+    account: &mut impl FnMut(Node<'tree>, SignaturePart) -> usize,
+) -> usize {
     if matches!(node.kind(), "compound_statement" | "field_declaration_list") {
         return 0;
     }
+    let own = if node.kind() == "requires_expression" && !node.is_missing() {
+        account(node, SignaturePart::Constraint)
+    } else {
+        0
+    };
     let mut cursor = node.walk();
-    usize::from(node.kind() == "requires_expression" && !node.is_missing())
-        + node.named_children(&mut cursor).map(requires_expressions).sum::<usize>()
+    own + node
+        .named_children(&mut cursor)
+        .map(|child| requires_expressions(child, account))
+        .sum::<usize>()
 }
 
-fn spelled_type_cost(node: Node<'_>) -> usize {
-    field_type_cost(node, "type") + inner_declarator(node).map_or(0, declarator_type_cost)
+fn spelled_type_cost<'tree>(
+    node: Node<'tree>,
+    account: &mut impl FnMut(Node<'tree>, SignaturePart) -> usize,
+) -> usize {
+    field_type_cost(node, "type", account)
+        + inner_declarator(node).map_or(0, |child| declarator_type_cost(child, account))
 }
 
-fn field_type_cost(node: Node<'_>, field: &str) -> usize {
-    node.child_by_field_name(field).map_or(0, type_cost)
+fn field_type_cost<'tree>(
+    node: Node<'tree>,
+    field: &str,
+    account: &mut impl FnMut(Node<'tree>, SignaturePart) -> usize,
+) -> usize {
+    node.child_by_field_name(field).map_or(0, |child| type_cost(child, account))
 }
 
-fn trailing_return_cost(node: Node<'_>) -> usize {
+fn trailing_return_cost<'tree>(
+    node: Node<'tree>,
+    account: &mut impl FnMut(Node<'tree>, SignaturePart) -> usize,
+) -> usize {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .filter(|child| child.kind() == "trailing_return_type")
-        .map(type_cost)
+        .map(|child| type_cost(child, account))
         .sum()
 }
 
-fn layer_type_cost(node: Node<'_>) -> usize {
-    let layers = usize::from(is_type_layer(node));
-    layers
-        + match node.kind() {
-            "function_declarator" | "abstract_function_declarator" => {
-                field_type_cost(node, "parameters") + trailing_return_cost(node)
-            }
-            "array_declarator" | "abstract_array_declarator" => field_type_cost(node, "size"),
-            "qualified_identifier" if is_member_pointer(node) => field_type_cost(node, "scope"),
-            _ => 0,
+fn layer_type_cost<'tree>(
+    node: Node<'tree>,
+    account: &mut impl FnMut(Node<'tree>, SignaturePart) -> usize,
+) -> usize {
+    match node.kind() {
+        "function_declarator" | "abstract_function_declarator" => {
+            // The parameter list starts at its opening paren, not at the nested name.
+            let parameters = node.child_by_field_name("parameters");
+            account(parameters.unwrap_or(node), SignaturePart::TypeComplexity)
+                + parameters.map_or(0, |child| type_cost(child, account))
+                + trailing_return_cost(node, account)
         }
+        "array_declarator" | "abstract_array_declarator" => {
+            account(node, SignaturePart::TypeLayer("["))
+                + field_type_cost(node, "size", account)
+        }
+        "pointer_declarator" | "abstract_pointer_declarator" | "pointer_type_declarator" => {
+            account(node, SignaturePart::TypeLayer("*"))
+        }
+        "reference_declarator" | "abstract_reference_declarator" => {
+            account(node, SignaturePart::TypeLayer("&"))
+        }
+        "qualified_identifier" if is_member_pointer(node) => field_type_cost(node, "scope", account),
+        _ => 0,
+    }
+}
+
+pub(super) fn layer_token<'tree>(node: Node<'tree>, token: &str) -> Node<'tree> {
+    // Error recovery can leave the token absent; retain the existing unit in that case.
+    let mut cursor = node.walk();
+    let anchor = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == token || (token == "&" && child.kind() == "&&"));
+    anchor.unwrap_or(node)
 }
 
 fn is_member_pointer(node: Node<'_>) -> bool {
     local_name(node).is_some_and(|name| name.kind() == "pointer_type_declarator")
 }
 
-fn declarator_type_cost(node: Node<'_>) -> usize {
+fn declarator_type_cost<'tree>(
+    node: Node<'tree>,
+    account: &mut impl FnMut(Node<'tree>, SignaturePart) -> usize,
+) -> usize {
     let inner = if node.kind() == "qualified_identifier" && is_member_pointer(node) {
         qualified_child(node)
     } else {
         inner_declarator(node)
     };
-    layer_type_cost(node) + inner.map_or(0, declarator_type_cost)
+    layer_type_cost(node, account) + inner.map_or(0, |child| declarator_type_cost(child, account))
 }
 
-fn type_cost(node: Node<'_>) -> usize {
+fn type_cost<'tree>(
+    node: Node<'tree>,
+    account: &mut impl FnMut(Node<'tree>, SignaturePart) -> usize,
+) -> usize {
     if node.is_missing() || node.is_extra() {
         return 0;
     }
     match node.kind() {
         "type_descriptor" | "parameter_declaration" | "optional_parameter_declaration"
-        | "variadic_parameter_declaration" => return spelled_type_cost(node),
+        | "variadic_parameter_declaration" => return spelled_type_cost(node, account),
         "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
-            return field_type_cost(node, "name");
+            return field_type_cost(node, "name", account);
         }
         "attribute_declaration" | "attribute_specifier" | "compound_statement"
         | "field_declaration_list" | "requires_clause" | "requires_expression"
         | "template_parameter_list" => return 0,
-        _ if is_type_layer(node) => return declarator_type_cost(node),
+        _ if is_type_layer(node) => return declarator_type_cost(node, account),
         _ => {}
     }
     let arguments = node.kind() == "template_argument_list";
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .filter(|child| !child.is_missing() && !child.is_extra() && !child.is_error())
-        .map(|child| usize::from(arguments) + type_cost(child))
+        .map(|child| {
+            let own = if arguments {
+                account(child, SignaturePart::TypeComplexity)
+            } else {
+                0
+            };
+            own + type_cost(child, account)
+        })
         .sum()
 }

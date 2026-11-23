@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use tree_sitter::Node;
 
+use super::hunks::FileScore;
 use super::metrics::body_metrics;
 use super::signature::{declarator, name_text, signature, template_parameter_count, Declarator};
 use super::{Access, Body, Kind, OwnerKind, Role, Span, Symbol};
@@ -19,8 +20,9 @@ pub(super) fn symbols(
     root: Node<'_>,
     source: &[u8],
     scopes: &mut HashMap<String, OwnerKind>,
+    hunks: Option<&mut FileScore<'_>>,
 ) -> Vec<Symbol> {
-    let mut walker = Walker { source, scopes, symbols: Vec::new() };
+    let mut walker = Walker { source, scopes, hunks, symbols: Vec::new() };
     walker.visit(root, &mut Context::default());
     for symbol in &mut walker.symbols {
         if let Some(kind) = symbol.qualified_owner.as_ref().and_then(|name| walker.scopes.get(name).copied()) {
@@ -36,13 +38,14 @@ pub(super) fn symbols(
     walker.symbols
 }
 
-struct Walker<'a> {
+struct Walker<'a, 'ranges> {
     source: &'a [u8],
     scopes: &'a mut HashMap<String, OwnerKind>,
+    hunks: Option<&'a mut FileScore<'ranges>>,
     symbols: Vec<Symbol>,
 }
 
-impl Walker<'_> {
+impl Walker<'_, '_> {
     fn visit(&mut self, node: Node<'_>, ctx: &mut Context<'_>) {
         match node.kind() {
             "namespace_definition" => self.scope(node, *ctx, Kind::Namespace, None),
@@ -184,6 +187,7 @@ impl Walker<'_> {
             kind,
             role,
             name: qualify(ctx.prefix, &name_text(name, self.source)),
+            name_position: terminal(name).start_position(),
             span,
             access,
             named_surface: !ctx.local,
@@ -326,23 +330,43 @@ impl Walker<'_> {
             _ => Kind::Function,
         };
         let access = ctx.access.or(qualified_owner.as_ref().map(|_| Access::Unknown));
-        let signature = signature(owner, Some(decl), templates, self.source);
+        let (body, signature) = self.callable_metrics(owner, Some(decl), templates, implementation);
         self.symbols.push(Symbol {
             kind,
             role: if implementation.is_some() { Role::Definition } else { Role::Declaration },
             name: qualify(ctx.prefix, &name),
+            name_position: unqualified.start_position(),
             span,
             access,
             named_surface: !ctx.local,
             template_heads: templates.len(),
-            template_parameters: signature.template_parameters,
-            signature: Some(signature),
-            body: implementation.map(|body| Body {
-                span: Span::through(named_child(owner, "field_initializer_list").unwrap_or(body), body),
-                metrics: body_metrics(owner, body),
-            }),
+            template_parameters: signature.as_ref().map_or(0, |s| s.template_parameters),
+            signature,
+            body,
             qualified_owner,
         });
+    }
+
+    fn callable_metrics<'tree>(
+        &mut self,
+        owner: Node<'tree>,
+        decl: Option<Declarator<'tree>>,
+        templates: &[Node<'tree>],
+        implementation: Option<Node<'tree>>,
+    ) -> (Option<Body>, Option<super::Signature>) {
+        if let Some(hunks) = self.hunks.as_deref_mut() {
+            if let Some(body) = implementation {
+                hunks.body(owner, body);
+                signature(owner, decl, templates, self.source, |node, part| hunks.signature(node, part));
+            }
+            (None, None)
+        } else {
+            let body = implementation.map(|body| Body {
+                span: Span::through(named_child(owner, "field_initializer_list").unwrap_or(body), body),
+                metrics: body_metrics(owner, body),
+            });
+            (body, Some(signature(owner, decl, templates, self.source, |_, _| 1)))
+        }
     }
 
     // A relative qualifier can name a nested scope even when it repeats the
@@ -375,18 +399,19 @@ impl Walker<'_> {
         };
         let position = node.start_position();
         let name = qualify(ctx.prefix, &format!("<lambda@{}:{}>", position.row + 1, position.column + 1));
-        let signature = signature(node, None, &[], self.source);
+        let (body_metrics, signature) = self.callable_metrics(node, None, &[], Some(body));
         self.symbols.push(Symbol {
             kind: Kind::Lambda,
             role: Role::Definition,
             name: name.clone(),
+            name_position: position,
             span: Span::of(node),
             access: None,
             named_surface: false,
             template_heads: usize::from(node.child_by_field_name("template_parameters").is_some()),
-            template_parameters: signature.template_parameters,
-            signature: Some(signature),
-            body: Some(Body { span: Span::of(body), metrics: body_metrics(node, body) }),
+            template_parameters: signature.as_ref().map_or(0, |s| s.template_parameters),
+            signature,
+            body: body_metrics,
             qualified_owner: None,
         });
         let mut cursor = node.walk();

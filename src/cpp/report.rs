@@ -23,6 +23,7 @@ pub(crate) enum Report {
     Signature,
     Span,
     Scorecard { top: Option<usize> },
+    DiffHunks { top: Option<usize> },
 }
 
 impl Report {
@@ -34,6 +35,7 @@ impl Report {
             Self::Signature => "Signatures",
             Self::Span => "Implementation Spans",
             Self::Scorecard { .. } => "Scorecard",
+            Self::DiffHunks { .. } => "Diff-hunk Scorecard",
         }
     }
 }
@@ -56,11 +58,15 @@ pub(crate) fn run(selection: &Selection, report: Report, json: bool, verbose: bo
     let inputs = match report {
         Report::Loc { .. } => Inputs::Loc,
         Report::Scorecard { .. } => Inputs::Scorecard,
+        Report::DiffHunks { top } => Inputs::DiffHunks { collect_contributors: top != Some(0) },
         _ => Inputs::Symbols,
     };
     let analysis = analyze(selection, inputs);
     if let Report::Scorecard { top } = report {
         return super::score::run(selection, analysis, top, json, verbose);
+    }
+    if let Report::DiffHunks { top } = report {
+        return super::hunks::run(selection, &analysis, top, json);
     }
     if !json {
         print_summary(selection, &analysis, report.heading());
@@ -71,7 +77,7 @@ pub(crate) fn run(selection: &Selection, report: Report, json: bool, verbose: bo
         Report::Branching | Report::Signature | Report::Span => {
             render_callables(selection, &analysis, report, json, verbose);
         }
-        Report::Scorecard { .. } => unreachable!(),
+        Report::Scorecard { .. } | Report::DiffHunks { .. } => unreachable!(),
     }
     analysis.status == Status::Complete
 }

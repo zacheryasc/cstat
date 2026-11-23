@@ -7,8 +7,11 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use serde::Serialize;
 use serde_json::{json, Value};
 use walkdir::WalkDir;
+
+mod hunks;
 
 const EXTENSIONS: &[&str] = &[
     "cpp", "cc", "cxx", "C", "h", "hpp", "hh", "hxx", "ipp", "tpp",
@@ -52,7 +55,7 @@ pub(crate) fn display_path(path: &Path) -> Cow<'_, str> {
 
 pub(crate) struct Selection {
     pub root: PathBuf,
-    pub files: Vec<PathBuf>, // Relative to root, sorted, unique physical files.
+    pub files: Vec<PathBuf>, // Relative to root, sorted, deduplicated by identity outside hunk mode.
     pub include_dirs: Vec<PathBuf>,
     pub diagnostics: Vec<Diagnostic>,
     mode: &'static str,
@@ -61,6 +64,18 @@ pub(crate) struct Selection {
     git_ignores: bool,
     git_inventory: Option<Vec<u8>>,
     identities: HashMap<FileIdentity, usize>,
+    added_lines: Option<Vec<AddedLines>>, // Indexed in the same order as files.
+}
+
+#[derive(Clone, Copy, Serialize)]
+pub(crate) struct LineRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+pub(crate) enum AddedLines {
+    All,
+    Ranges(Vec<LineRange>),
 }
 
 pub(crate) struct Diagnostic {
@@ -74,7 +89,13 @@ impl Selection {
     }
 
     pub(crate) fn is_changed(&self) -> bool {
-        self.mode == "changed"
+        self.base.is_some()
+    }
+
+    pub(crate) fn added_lines(&self, path: &Path) -> Option<&AddedLines> {
+        let lines = self.added_lines.as_ref()?;
+        let index = self.files.binary_search_by(|file| file.as_path().cmp(path)).ok()?;
+        Some(&lines[index])
     }
 
     pub(crate) fn rules_json(&self) -> Value {
@@ -119,7 +140,11 @@ pub(crate) fn select(
     base: Option<&str>,
     excludes: &[String],
     include_dirs: &[PathBuf],
+    diff_hunks: bool,
 ) -> Result<Selection, String> {
+    if diff_hunks && base.is_none() {
+        return Err("--diff-hunks requires --changed".into());
+    }
     let resolve_error = |error| format!("Cannot resolve path '{}': {error}", display_path(path));
     let resolve = |location: &Path| fs::canonicalize(location).map_err(resolve_error);
     let meta = fs::metadata(path).map_err(resolve_error)?;
@@ -179,7 +204,9 @@ pub(crate) fn select(
         files: Vec::new(),
         include_dirs: resolved_dirs,
         diagnostics: Vec::new(),
-        mode: if base.is_some() {
+        mode: if diff_hunks {
+            "diff_hunks"
+        } else if base.is_some() {
             "changed"
         } else if explicit.is_some() {
             "file"
@@ -191,11 +218,14 @@ pub(crate) fn select(
         git_ignores: worktree.is_some(),
         git_inventory: None,
         identities: HashMap::new(),
+        added_lines: diff_hunks.then(Vec::new),
     };
     let mut candidates = Vec::new();
+    let changed;
+    let mut hunk_ranges = None;
     if let Some(worktree) = &worktree {
         let scope = explicit.map_or_else(|| OsString::from("."), literal_pathspec);
-        let changed = if let Some(base) = base {
+        changed = if let Some(base) = base {
             let commit = super::git_output(
                 &result.root,
                 &[
@@ -209,31 +239,43 @@ pub(crate) fn select(
             let commit = String::from_utf8_lossy(&commit);
             // Git can report D for an inaccessible index entry. Keep every
             // status and let the filesystem distinguish absence from denial.
+            let base = commit.trim_end();
+            let names = ["diff", "--name-only", "--relative", "--no-renames", "-z", base, "--"];
+            let patch = [
+                "diff", "--patch-with-raw", "--relative", "--no-renames", "-z", "--unified=0",
+                "--inter-hunk-context=0", "--diff-algorithm=myers", "--indent-heuristic",
+                "--no-color", "--word-diff=none", "--no-ext-diff", "--no-textconv", "--text",
+                "--src-prefix=a/", "--dst-prefix=b/", "--ignore-submodules=none", "--submodule=short",
+                base, "--",
+            ];
             Some(Selection::git_listing(
                 &result.root,
                 &mut result.diagnostics,
-                &[
-                    "diff",
-                    "--name-only",
-                    "--relative",
-                    "--no-renames",
-                    "-z",
-                    commit.trim_end(),
-                    "--",
-                ],
+                if diff_hunks { &patch } else { &names },
                 &scope,
                 None,
             ))
         } else {
             None
         };
-        let changed = changed.as_deref().map(|listing| {
-            listing
-                .split(|&byte| byte == 0)
-                .filter_map(super::git_path)
-                .filter(|path| is_cpp_source(path))
-                .collect::<HashSet<_>>()
-        });
+        let changed_names = if diff_hunks {
+            hunk_ranges = Some(hunks::parse(changed.as_deref().unwrap_or_default()).unwrap_or_else(|error| {
+                Selection::git_diagnostic(
+                    &mut result.diagnostics,
+                    format!("Malformed Git diff output: {error}"),
+                );
+                HashMap::new()
+            }));
+            None
+        } else {
+            changed.as_deref().map(|listing| {
+                listing
+                    .split(|&byte| byte == 0)
+                    .filter_map(super::git_path)
+                    .filter(|path| is_cpp_source(path))
+                    .collect::<HashSet<_>>()
+            })
+        };
         let relative_root = result.root.strip_prefix(worktree).unwrap();
         let inventory = Selection::git_listing(
             &result.root,
@@ -248,15 +290,18 @@ pub(crate) fn select(
             git_entries(&inventory)
                 .filter(|(untracked, path)| {
                     is_cpp_source(path)
-                        && (*untracked || changed.as_ref().is_none_or(|set| set.contains(path)))
+                        && (*untracked || match &hunk_ranges {
+                            Some(ranges) => ranges.contains_key(path),
+                            None => changed_names.as_ref().is_none_or(|set| set.contains(path)),
+                        })
                 })
-                .map(|(_, path)| path.to_path_buf()),
+                .map(|(untracked, path)| (path.to_path_buf(), untracked)),
         );
         if explicit.is_none() {
             result.git_inventory = Some(inventory);
         }
     } else if let Some(file) = explicit {
-        candidates.push(file.to_path_buf());
+        candidates.push((file.to_path_buf(), false));
     } else {
         for entry in WalkDir::new(&result.root)
             .follow_links(false)
@@ -271,13 +316,8 @@ pub(crate) fn select(
         {
             match entry {
                 Ok(entry) if is_cpp_source(entry.path()) && !entry.file_type().is_dir() => {
-                    candidates.push(
-                        entry
-                            .path()
-                            .strip_prefix(&result.root)
-                            .unwrap()
-                            .to_path_buf(),
-                    );
+                    let path = entry.path().strip_prefix(&result.root).unwrap();
+                    candidates.push((path.to_path_buf(), false));
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -294,11 +334,12 @@ pub(crate) fn select(
         }
     }
 
-    candidates.sort_unstable();
-    candidates.dedup();
+    // If Git reports both statuses, prefer the untracked inventory entry.
+    candidates.sort_unstable_by(|(a, a_untracked), (b, b_untracked)| a.cmp(b).then(b_untracked.cmp(a_untracked)));
+    candidates.dedup_by(|a, b| a.0 == b.0);
     let mut safe_dirs = HashMap::new();
     let mut worktree_dirs = HashMap::new();
-    for file in candidates {
+    for (file, untracked) in candidates {
         if (result.git_ignores || explicit.is_some()) && patterns.excludes_file(&file)
             || explicit.is_some_and(|only| only != file)
         {
@@ -318,16 +359,29 @@ pub(crate) fn select(
                 &file,
                 &patterns,
                 result.git_ignores.then_some(&mut worktree_dirs),
+                diff_hunks,
             )
         })();
         match identity {
             Ok(Some(identity)) => {
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    result.identities.entry(identity)
-                {
-                    entry.insert(result.files.len());
-                    result.files.push(file);
+                let index = result.files.len();
+                let first = *result.identities.entry(identity).or_insert(index);
+                if !diff_hunks && first != index {
+                    continue;
                 }
+                if let Some(added) = &mut result.added_lines {
+                    // A nonignored untracked path has no current tracked base,
+                    // even when the same spelling was deleted from the index.
+                    added.push(if untracked {
+                        AddedLines::All
+                    } else {
+                        AddedLines::Ranges(
+                            hunk_ranges.as_mut().unwrap().remove(file.as_path()).flatten().unwrap(),
+                        )
+                    });
+                }
+                // Each hardlink spelling has its own Git diff and ranges.
+                result.files.push(file);
             }
             Err(error) => result.diagnostics.push(Diagnostic {
                 file,
@@ -351,6 +405,10 @@ impl Selection {
         excludes: Option<(&Path, &Excludes)>,
     ) -> Vec<u8> {
         let mut command = git(root);
+        if args.contains(&"--patch-with-raw") {
+            // Git gives this legacy environment variable precedence over -U.
+            command.env_remove("GIT_DIFF_OPTS");
+        }
         command.args(args).arg(scope);
         let mut output = command.output();
         if let (Some((root, rules)), Some(initial)) = (
@@ -524,12 +582,16 @@ fn file_identity(
     file: &Path,
     excludes: &Excludes,
     git_dirs: Option<&mut HashMap<PathBuf, bool>>,
+    skip_symlinks: bool,
 ) -> io::Result<Option<FileIdentity>> {
     let mut path = root.join(file);
     let Some(mut meta) = optional_meta(fs::symlink_metadata(&path))? else {
         return Ok(None);
     };
     if meta.file_type().is_symlink() {
+        if skip_symlinks {
+            return Ok(None);
+        }
         match fs::canonicalize(&path) {
             Ok(target) if target.starts_with(root) => path = target,
             Ok(_) => return Ok(None),

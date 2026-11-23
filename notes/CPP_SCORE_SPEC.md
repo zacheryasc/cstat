@@ -305,6 +305,55 @@ Incomplete scorecard JSON excerpt (the absence of the scalar is intentional):
 }
 ```
 
+## Opt-in diff-hunk score
+
+`cstat scorecard --language cpp --changed BASE --diff-hunks --json` compares
+`BASE` (default `HEAD`) to the current worktree. For tracked paths it uses
+Git's zero-context unified diff (Myers with the indent heuristic, zero inter-hunk
+context, no rename detection or text conversion). Only nonempty **new-side** hunk
+ranges are eligible; a replacement contributes its new lines, never a credit
+for its old lines. A tracked addition or move destination is scored in full;
+nonignored untracked files are also eligible on every line, even if their name
+was removed from the index. Absent files are skipped, and a surviving
+deletion-only or mode-only change has no eligible lines.
+
+File extensions, scope under `--path`, and `--exclude` still apply. Leaf
+symlinks are not followed because their Git hunks describe the link, not C++
+source. Hardlinked paths are evaluated independently against their own Git
+base paths. Git's ordinary worktree normalization still applies; a clean
+filter that rearranges source lines is incompatible with these coordinates.
+
+Parse the full current file. Count each unit below only if the first byte of
+its anchor is on an eligible line. This is line-based, not token differencing:
+multiple anchors on a replacement line can count, even if one of those tokens
+is unchanged. A changed continuation, nested statement, or closing brace
+does not by itself make its enclosing construct eligible.
+
+| Contributor `kind` | Cost | Anchor |
+| --- | ---: | --- |
+| `body` | 1 | First token of the callable body node (usually `{`, or `try` for a function-try body node). |
+| `decision` | 2 | Decision's leading keyword for branches, loops, labels, and catches; the `?`, `&&`/`and`, or `\|\|`/`or` token for expression decisions. |
+| `statement` | 1 | First token of the executable or declaration statement counted by the body-metrics rules. A control statement can contribute both a decision and a statement. |
+| `template_parameter` | 1 | Start of each direct signature template parameter entry for a callable with a body. |
+| `constraint` | 2 | Each `requires` keyword counted in the signature of a callable with a body. |
+| `type_complexity` | 1 | Start of each counted template argument, or the token identifying a derived type layer in a callable definition's signature (`*`, `&`, `&&`, `[`, or the nested parameter list's `(`). |
+| `named_surface` | 1 or 2 | Start of the declared name, not the start of an enclosing template, declarator, or scope. The ordinary named-surface and eligible-header rules determine whether it gets the extra point. |
+
+The result sums these nonnegative costs as `diff_hunk_complexity_cost`, with
+`score_version: "cpp_diff_hunk_complexity_cost_v1"`. It omits whole-body maximum
+nesting squared, parameter excess squared, file concentration, and all include
+coupling: those aggregate terms would depend on unchanged code. It does not
+resolve includes or accept `--include-dir`. No numeric comparison to
+`cpp_code_complexity_cost_v1` is meaningful.
+
+JSON `files` lists paths with their per-file costs and `added_lines` (inclusive,
+one-based `{start,end}` pairs, in source order). `contributors` lists the path,
+one-based line and byte column, contributor kind, syntax kind, and cost. Without
+`--top` all contributors appear in path/source order and sum to the scalar.
+`--top N` limits only the contributor list, ranked by cost with path/source
+tie-breakers. A clean selection with no additions scores zero, including an
+empty selection. Incomplete runs still exit nonzero and withhold the score.
+
 ## Real-project validation
 
 Release `cstat` on Linux x86-64, against a local [OCUDU](https://gitlab.com/ocudu/ocudu)
