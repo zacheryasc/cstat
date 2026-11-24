@@ -60,28 +60,52 @@ pub struct FileDependencyReport {
     pub external: Vec<FileDependency>,
 }
 
-/// Extract use targets from a Rust source file.
-fn extract_use_targets(source: &str) -> Vec<String> {
-    let ast = match syn::parse_file(source) {
-        Ok(f) => f,
-        Err(_) => return vec![],
-    };
+struct ModuleIndex<'a> {
+    known: HashMap<&'a str, &'a Path>,
+    unscored: HashSet<String>,
+}
 
-    let mut targets = Vec::new();
-    for item in &ast.items {
-        match item {
-            syn::Item::Use(use_item) => {
-                collect_use_paths(&use_item.tree, &mut vec![], &mut targets);
-            }
-            syn::Item::Mod(mod_item) => {
-                if mod_item.content.is_none() {
-                    targets.push(mod_item.ident.to_string());
-                }
-            }
-            _ => {}
+impl<'a> ModuleIndex<'a> {
+    fn new(module_names: &'a [String], files: &'a [PathBuf]) -> Self {
+        Self {
+            known: module_names
+                .iter()
+                .map(String::as_str)
+                .zip(files.iter().map(PathBuf::as_path))
+                .collect(),
+            unscored: HashSet::new(),
         }
     }
-    targets
+
+    fn read_imports(&mut self, file: &Path, module: &str, collect_uses: bool) -> Vec<String> {
+        let Ok(source) = std::fs::read_to_string(file) else {
+            return Vec::new();
+        };
+        let Ok(ast) = syn::parse_file(&source) else {
+            return Vec::new();
+        };
+
+        let mut targets = Vec::new();
+        for item in &ast.items {
+            match item {
+                syn::Item::Use(use_item) if collect_uses => {
+                    collect_use_paths(&use_item.tree, &mut vec![], &mut targets);
+                }
+                syn::Item::Mod(mod_item) if mod_item.content.is_none() => {
+                    let name = mod_item.ident.to_string();
+                    let child = format!("{module}::{name}");
+                    if !self.known.contains_key(child.as_str()) {
+                        self.unscored.insert(child);
+                    }
+                    if collect_uses {
+                        targets.push(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        targets
+    }
 }
 
 /// Recursively collect paths from a use tree.
@@ -114,79 +138,85 @@ fn collect_use_paths(tree: &syn::UseTree, prefix: &mut Vec<String>, results: &mu
 }
 
 /// Match a use/mod path to a known project module name from a source-module context.
-fn resolve_to_module(
+fn resolve_to_module<'a>(
     use_path: &str,
-    known_modules: &HashSet<String>,
+    modules: &ModuleIndex<'a>,
     current_module: &str,
-) -> Option<String> {
+    crate_base: &str,
+) -> Option<&'a str> {
     if use_path == "crate" {
         return None;
     }
     if use_path == "self" {
-        return known_modules
-            .contains(current_module)
-            .then(|| current_module.to_string());
+        return modules
+            .known
+            .get_key_value(current_module)
+            .map(|(&name, _)| name);
     }
-    if use_path == "super" {
-        return parent_module(current_module)
-            .filter(|parent| known_modules.contains(*parent))
-            .map(ToString::to_string);
-    }
-
     if let Some(rest) = use_path.strip_prefix("crate::") {
-        return resolve_absolute_module_path(rest, known_modules);
+        return resolve_relative_module_path(crate_base, rest, modules);
     }
-
     if let Some(rest) = use_path.strip_prefix("self::") {
-        return resolve_relative_module_path(current_module, rest, known_modules).or_else(|| {
-            known_modules
-                .contains(current_module)
-                .then(|| current_module.to_string())
-        });
+        return resolve_relative_module_path(current_module, rest, modules);
     }
 
-    let mut base = current_module;
-    let mut rest = use_path;
-    let mut saw_super = false;
-    while let Some(stripped) = rest.strip_prefix("super::") {
-        saw_super = true;
-        base = parent_module(base).unwrap_or("");
-        rest = stripped;
-    }
-    if saw_super {
-        return resolve_relative_module_path(base, rest, known_modules)
-            .or_else(|| known_modules.contains(base).then(|| base.to_string()));
-    }
-
-    resolve_relative_module_path(current_module, use_path, known_modules)
-        .or_else(|| resolve_absolute_module_path(use_path, known_modules))
-}
-
-fn resolve_absolute_module_path(path: &str, known_modules: &HashSet<String>) -> Option<String> {
-    let parts: Vec<&str> = path.split("::").filter(|part| !part.is_empty()).collect();
-    for len in (1..=parts.len()).rev() {
-        let candidate = parts[..len].join("::");
-        if known_modules.contains(&candidate) {
-            return Some(candidate);
+    if use_path == "super" || use_path.starts_with("super::") {
+        let mut base = current_module;
+        let mut rest = use_path;
+        while rest == "super" || rest.starts_with("super::") {
+            if base == crate_base {
+                return None;
+            }
+            base = parent_module(base).unwrap_or(crate_base);
+            rest = rest.strip_prefix("super::").unwrap_or("");
         }
+        return resolve_relative_module_path(base, rest, modules);
     }
-    None
+
+    resolve_relative_module_path(current_module, use_path, modules)
+        .or_else(|| resolve_absolute_module_path(use_path, modules))
 }
 
-fn resolve_relative_module_path(
+fn resolve_absolute_module_path<'a>(mut path: &str, modules: &ModuleIndex<'a>) -> Option<&'a str> {
+    loop {
+        if let Some((&module, _)) = modules.known.get_key_value(path) {
+            return Some(module);
+        }
+        // An excluded file module is still a module, not an item in its parent.
+        if modules.unscored.contains(path) {
+            return None;
+        }
+        path = parent_module(path)?;
+    }
+}
+
+fn resolve_relative_module_path<'a>(
     base: &str,
     path: &str,
-    known_modules: &HashSet<String>,
-) -> Option<String> {
+    modules: &ModuleIndex<'a>,
+) -> Option<&'a str> {
     if base.is_empty() {
-        return resolve_absolute_module_path(path, known_modules);
-    }
-    let absolute = if path.is_empty() {
-        base.to_string()
+        resolve_absolute_module_path(path, modules)
+    } else if path.is_empty() {
+        resolve_absolute_module_path(base, modules)
     } else {
-        format!("{base}::{path}")
-    };
-    resolve_absolute_module_path(&absolute, known_modules)
+        resolve_absolute_module_path(&format!("{base}::{path}"), modules)
+    }
+}
+
+fn crate_module_base<'a>(module: &'a str, file: &Path, project_path: &Path) -> &'a str {
+    let relative = file.strip_prefix(project_path).unwrap_or(file);
+    match relative
+        .components()
+        .position(|part| part.as_os_str() == "src")
+    {
+        // The root crate's `src` is stripped from module IDs; workspace members retain it.
+        Some(depth) if depth > 0 => module
+            .match_indices("::")
+            .nth(depth)
+            .map_or("", |(index, _)| &module[..index]),
+        _ => "",
+    }
 }
 
 fn parent_module(module: &str) -> Option<&str> {
@@ -232,16 +262,16 @@ fn build_coupling_pairs(edges: &HashSet<DepEdge>) -> Vec<(String, String, usize)
 
 /// Build the full dependency analysis from discovered files.
 pub fn analyze_deps(rs_files: &[PathBuf], project_path: &Path) -> DepAnalysis {
-    let mut module_names: Vec<String> = Vec::new();
-    let mut file_to_module: HashMap<PathBuf, String> = HashMap::new();
-
-    for file in rs_files {
-        let name = crate_render::module_name_from_path(file, project_path);
-        file_to_module.insert(file.clone(), name.clone());
-        module_names.push(name);
-    }
-
-    let known_modules: HashSet<String> = module_names.iter().cloned().collect();
+    let mut module_names: Vec<_> = rs_files
+        .iter()
+        .map(|file| crate_render::module_name_from_path(file, project_path))
+        .collect();
+    let mut modules = ModuleIndex::new(&module_names, rs_files);
+    let imports: Vec<_> = rs_files
+        .iter()
+        .zip(&module_names)
+        .map(|(file, module)| modules.read_imports(file, module, true))
+        .collect();
 
     let mut edges: HashSet<DepEdge> = HashSet::new();
     let mut in_degree: HashMap<String, usize> = HashMap::new();
@@ -252,30 +282,19 @@ pub fn analyze_deps(rs_files: &[PathBuf], project_path: &Path) -> DepAnalysis {
         out_degree.insert(name.clone(), 0);
     }
 
-    for file in rs_files {
-        let source = match std::fs::read_to_string(file) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let from_module = match file_to_module.get(file) {
-            Some(m) => m.clone(),
-            None => continue,
-        };
-
-        let use_targets = extract_use_targets(&source);
-        let mut seen_targets: HashSet<String> = HashSet::new();
-
-        for target in &use_targets {
-            if let Some(to_module) = resolve_to_module(target, &known_modules, &from_module) {
-                if to_module != from_module && seen_targets.insert(to_module.clone()) {
+    for ((file, from_module), targets) in rs_files.iter().zip(&module_names).zip(imports) {
+        let crate_base = crate_module_base(from_module, file, project_path);
+        let mut seen_targets = HashSet::new();
+        for target in targets {
+            if let Some(to_module) = resolve_to_module(&target, &modules, from_module, crate_base) {
+                if to_module != from_module && seen_targets.insert(to_module) {
                     let edge = DepEdge {
                         from: from_module.clone(),
-                        to: to_module.clone(),
+                        to: to_module.to_string(),
                     };
                     if edges.insert(edge) {
-                        *out_degree.entry(from_module.clone()).or_insert(0) += 1;
-                        *in_degree.entry(to_module.clone()).or_insert(0) += 1;
+                        *out_degree.get_mut(from_module).unwrap() += 1;
+                        *in_degree.get_mut(to_module).unwrap() += 1;
                     }
                 }
             }
@@ -300,28 +319,38 @@ pub fn analyze_file_deps(
     project_path: &Path,
     file: &Path,
 ) -> FileDependencyReport {
-    let mut module_names: Vec<String> = rs_files
+    let module_names: Vec<_> = rs_files
         .iter()
-        .map(|path| crate_render::module_name_from_path(path, project_path))
+        .map(|file| crate_render::module_name_from_path(file, project_path))
         .collect();
-    module_names.sort();
-    module_names.dedup();
-    let known_modules: HashSet<String> = module_names.iter().cloned().collect();
+    let mut modules = ModuleIndex::new(&module_names, rs_files);
 
     let module = crate_render::module_name_from_path(file, project_path);
+    let crate_base = crate_module_base(&module, file, project_path);
     let file_display = relative_path_string(project_path, file);
-    let source = std::fs::read_to_string(file).unwrap_or_default();
-    let mut use_targets = extract_use_targets(&source);
+    let mut use_targets = modules.read_imports(file, &module, true);
     use_targets.sort();
     use_targets.dedup();
+    let mut indexed = HashSet::from([module.as_str()]);
 
     let mut internal = Vec::new();
     let mut external = Vec::new();
     for raw in use_targets {
-        if let Some(resolved_module) = resolve_to_module(&raw, &known_modules, &module) {
+        let resolved_module = loop {
+            let Some(candidate) = resolve_to_module(&raw, &modules, &module, crate_base) else {
+                break None;
+            };
+            if !indexed.insert(candidate) {
+                break Some(candidate);
+            }
+            // For a file report, only read declarations from potential targets.
+            let source = modules.known[candidate];
+            modules.read_imports(source, candidate, false);
+        };
+        if let Some(resolved_module) = resolved_module {
             internal.push(FileDependency {
                 raw,
-                resolved_module: Some(resolved_module),
+                resolved_module: Some(resolved_module.to_string()),
                 kind: FileDependencyKind::Internal,
             });
         } else {
@@ -606,4 +635,72 @@ fn extract_signature_types(file: &Path, line_start: usize, line_end: usize) -> H
         }
     }
     types
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sibling_import_spelling_preserves_dependency_edges() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cstat-sibling-import-{unique}"));
+        let mut results = Vec::new();
+        for source_root in ["src", "crates/member/src"] {
+            let src = root.join(source_root);
+            std::fs::create_dir_all(src.join("a")).unwrap();
+            let parent = src.join("a/mod.rs");
+            let importer = src.join("a/b.rs");
+            let sibling = src.join("a/c.rs");
+            std::fs::write(&parent, "mod b;\nmod c;\n").unwrap();
+            std::fs::write(&sibling, "pub struct Thing;\n").unwrap();
+
+            let unscored = [parent.clone(), importer.clone()];
+            let scored = [parent, importer.clone(), sibling.clone()];
+            let from = crate_render::module_name_from_path(&importer, &root);
+            let to = crate_render::module_name_from_path(&sibling, &root);
+            for path in [
+                "super::c::Thing",
+                "crate::a::c::Thing",
+                "super::c",
+                "crate::a::c",
+            ] {
+                std::fs::write(&importer, format!("use {path};\n")).unwrap();
+                let targets = |files: &[PathBuf]| {
+                    let edges = analyze_deps(files, &root)
+                        .edges
+                        .into_iter()
+                        .filter_map(|edge| (edge.from == from).then_some(edge.to))
+                        .collect::<Vec<_>>();
+                    let report = analyze_file_deps(files, &root, &importer);
+                    let imports: Vec<_> = report
+                        .internal
+                        .into_iter()
+                        .filter_map(|dependency| dependency.resolved_module)
+                        .collect();
+                    assert_eq!(edges, imports, "{source_root}: {path}");
+                    edges
+                };
+                results.push((
+                    source_root,
+                    path,
+                    targets(&unscored),
+                    targets(&scored),
+                    to.clone(),
+                ));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+
+        for (source_root, path, unscored, scored, to) in results {
+            assert!(
+                unscored.is_empty(),
+                "{source_root}: {path} resolved to {unscored:?}"
+            );
+            assert_eq!(scored, [to], "{source_root}: {path}");
+        }
+    }
 }
